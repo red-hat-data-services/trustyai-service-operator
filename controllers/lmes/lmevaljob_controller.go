@@ -53,6 +53,7 @@ import (
 
 	"github.com/go-logr/logr"
 	lmesv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/lmes/v1alpha1"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/dsc"
 	"github.com/trustyai-explainability/trustyai-service-operator/controllers/lmes/driver"
 )
 
@@ -274,6 +275,15 @@ func (r *LMEvalJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 		if err := constructOptionsFromConfigMap(&log, &cm); err != nil {
 			return err
+		}
+
+		// Read DSC configuration if available
+		dscReader := dsc.NewDSCConfigReader(r.Client, r.Namespace)
+		if dscConfig, err := dscReader.ReadDSCConfig(ctx, &log); err != nil {
+			log.Error(err, "failed to read DSC configuration, continuing with defaults")
+			// Don't return error here as DSC config is optional
+		} else {
+			ApplyDSCConfig(dscConfig)
 		}
 
 		return nil
@@ -508,9 +518,23 @@ func (r *LMEvalJobReconciler) handleNewCR(ctx context.Context, log logr.Logger, 
 		return ctrl.Result{}, err
 	}
 
+	// Read current permissions for this job deployment
+	permConfig, err := ReadEffectivePermissions(ctx, r.Client, r.Namespace, r.ConfigMap, &log)
+	if err != nil {
+		// Failed to read permissions. Mark the status as complete with failed
+		job.Status.State = lmesv1alpha1.CompleteJobState
+		job.Status.Reason = lmesv1alpha1.FailedReason
+		job.Status.Message = fmt.Sprintf("Failed to read configuration: %s", err.Error())
+		if err := r.Status().Update(ctx, job); err != nil {
+			log.Error(err, "unable to update LMEvalJob status for config read failure")
+		}
+		log.Error(err, "Failed to read permissions for LMEvalJob", "name", job.Name)
+		return ctrl.Result{}, err
+	}
+
 	// construct a new pod and create a pod for the job
 	currentTime := v1.Now()
-	pod := CreatePod(Options, job, log)
+	pod := CreatePod(Options, job, permConfig, log)
 	if err := r.Create(ctx, pod, &client.CreateOptions{}); err != nil {
 		// Failed to create the pod. Mark the status as complete with failed
 		job.Status.State = lmesv1alpha1.CompleteJobState
@@ -728,13 +752,21 @@ func (r *LMEvalJobReconciler) handleSuspend(ctx context.Context, log logr.Logger
 
 func (r *LMEvalJobReconciler) handleResume(ctx context.Context, log logr.Logger, job *lmesv1alpha1.LMEvalJob) (ctrl.Result, error) {
 	log.Info("Resume job")
-	pod := CreatePod(Options, job, log)
-	if err := r.Create(ctx, pod); err != nil {
-		log.Error(err, "failed to create pod to resume job")
+
+	// Read effective permissions for this job deployment
+	permConfig, err := ReadEffectivePermissions(ctx, r.Client, r.Namespace, r.ConfigMap, &log)
+	if err != nil {
+		log.Error(err, "Failed to read effective permissions for LMEvalJob resume", "name", job.Name)
+		return r.pullingJobs.addOrUpdate(string(job.GetUID()), Options.PodCheckingInterval), err
+	}
+
+	pod := CreatePod(Options, job, permConfig, log)
+	if createErr := r.Create(ctx, pod); createErr != nil {
+		log.Error(createErr, "failed to create pod to resume job")
 		return r.pullingJobs.addOrUpdate(string(job.GetUID()), Options.PodCheckingInterval), nil
 	}
 	job.Status.State = lmesv1alpha1.ScheduledJobState
-	err := r.Status().Update(ctx, job)
+	err = r.Status().Update(ctx, job)
 	if err != nil {
 		log.Error(err, "failed to update job status to scheduled")
 	}
@@ -853,7 +885,7 @@ func unmarshal(custom string, props []string) (map[string]interface{}, error) {
 	return obj, nil
 }
 
-func CreatePod(svcOpts *serviceOptions, job *lmesv1alpha1.LMEvalJob, log logr.Logger) *corev1.Pod {
+func CreatePod(svcOpts *serviceOptions, job *lmesv1alpha1.LMEvalJob, permConfig *PermissionConfig, log logr.Logger) *corev1.Pod {
 
 	var envVars = removeProtectedEnvVars(job.Spec.Pod.GetContainer().GetEnv())
 
@@ -928,6 +960,10 @@ func CreatePod(svcOpts *serviceOptions, job *lmesv1alpha1.LMEvalJob, log logr.Lo
 			Name:  "UNITXT_ALLOW_UNVERIFIED_CODE",
 			Value: "False",
 		},
+		{
+			Name:  "HF_ALLOW_CODE_EVAL",
+			Value: "0",
+		},
 	}
 	allowRemoteCodeEnvVars := []corev1.EnvVar{
 		{
@@ -942,12 +978,16 @@ func CreatePod(svcOpts *serviceOptions, job *lmesv1alpha1.LMEvalJob, log logr.Lo
 			Name:  "UNITXT_ALLOW_UNVERIFIED_CODE",
 			Value: "True",
 		},
+		{
+			Name:  "HF_ALLOW_CODE_EVAL",
+			Value: "1",
+		},
 	}
 
 	if job.Spec.AllowCodeExecution != nil && *job.Spec.AllowCodeExecution {
 		// Disable remote code execution by default
 
-		if !svcOpts.AllowCodeExecution {
+		if !permConfig.AllowCodeExecution {
 			log.Error(fmt.Errorf("code execution not allowed by the operator"), "change this setting and redeploy the operator")
 			envVars = append(envVars, disallowRemoteCodeEnvVars...)
 		} else {
@@ -984,7 +1024,7 @@ func CreatePod(svcOpts *serviceOptions, job *lmesv1alpha1.LMEvalJob, log logr.Lo
 	// Enforce offline mode by default
 	if job.Spec.AllowOnline != nil && *job.Spec.AllowOnline {
 
-		if !svcOpts.AllowOnline {
+		if !permConfig.AllowOnline {
 			log.Error(fmt.Errorf("online mode not allowed by the operator"), "change this setting and redeploy the operator")
 			envVars = append(envVars, offlineHuggingFaceEnvVars...)
 		}
@@ -1138,7 +1178,7 @@ func CreatePod(svcOpts *serviceOptions, job *lmesv1alpha1.LMEvalJob, log logr.Lo
 			Image:           svcOpts.PodImage,
 			ImagePullPolicy: svcOpts.ImagePullPolicy,
 			Env:             envVars,
-			Command:         generateCmd(svcOpts, job),
+			Command:         generateCmd(svcOpts, job, permConfig),
 			Args:            generateArgs(svcOpts, job, log),
 			SecurityContext: mainSecurityContext,
 			VolumeMounts:    volumeMounts,
@@ -1361,6 +1401,12 @@ func generateArgs(svcOpts *serviceOptions, job *lmesv1alpha1.LMEvalJob, log logr
 		}
 	}
 
+	// --confirm_run_unsafe_code
+	log.Info("Enabling unsafe code execution for LMEvalJob", "jobName", job.Name, "namespace", job.Namespace)
+	if job.Spec.AllowCodeExecution != nil && *job.Spec.AllowCodeExecution {
+		cmds = append(cmds, "--confirm_run_unsafe_code")
+	}
+
 	return cmds
 }
 
@@ -1377,7 +1423,7 @@ func concatTasks(tasks lmesv1alpha1.TaskList) []string {
 	return append(tasks.TaskNames, recipesName...)
 }
 
-func generateCmd(svcOpts *serviceOptions, job *lmesv1alpha1.LMEvalJob) []string {
+func generateCmd(svcOpts *serviceOptions, job *lmesv1alpha1.LMEvalJob, permConfig *PermissionConfig) []string {
 	if job == nil {
 		return nil
 	}
@@ -1398,7 +1444,7 @@ func generateCmd(svcOpts *serviceOptions, job *lmesv1alpha1.LMEvalJob) []string 
 		cmds = append(cmds, "--listen-port", fmt.Sprintf("%d", svcOpts.DriverPort))
 	}
 
-	if job.Spec.AllowOnline != nil && *job.Spec.AllowOnline && svcOpts.AllowOnline {
+	if job.Spec.AllowOnline != nil && *job.Spec.AllowOnline && permConfig.AllowOnline {
 		cmds = append(cmds, "--allow-online")
 	}
 
@@ -1510,6 +1556,7 @@ var ProtectedEnvVarNames = []string{
 	"TRANSFORMERS_OFFLINE",
 	"HF_EVALUATE_OFFLINE",
 	"UNITXT_ALLOW_UNVERIFIED_CODE",
+	"HF_ALLOW_CODE_EVAL",
 }
 
 // removeProtectedEnvVars removes protected EnvVars from a list of EnvVars

@@ -25,18 +25,36 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+type AutoConfig struct {
+	// The name of the inference service that provides the vLLM generation model to-be-guardrailed
+	InferenceServiceToGuardrail string `json:"inferenceServiceToGuardrail"`
+
+	/* Label key to use when automatically identifying guardrail detector inference services.
+	If provided, all inference services with the label `$detectorServiceLabelToMatch: true` will be used as a guardrails detector.
+	If not provided, the default match label is `trustyai/guardrails`, and the autoconfig will use all inference services with the label `trustyai/guardrails: true` as detectors.
+	*/
+	// +optional
+	DetectorServiceLabelToMatch string `json:"detectorServiceLabelToMatch,omitempty"`
+}
+
 // GuardrailsOrchestratorSpec defines the desired state of GuardrailsOrchestrator.
 type GuardrailsOrchestratorSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-
 	// Number of replicas
 	Replicas int32 `json:"replicas"`
 	// Name of configmap containing generator,detector,and chunker arguments
-	OrchestratorConfig *string `json:"orchestratorConfig"`
+	// +optional
+	OrchestratorConfig *string `json:"orchestratorConfig,omitempty"`
+	// Settings governing the automatic configuration of the orchestrator. Replaces `OrchestratorConfig`.
+	// +optional
+	AutoConfig *AutoConfig `json:"autoConfig,omitempty"`
 	// Boolean flag to enable/disable built-in detectors
 	// +optional
 	EnableBuiltInDetectors bool `json:"enableBuiltInDetectors,omitempty"`
+	// Name of configmap containing user-defined Python detectors. This is only used if EnableBuiltInDetectors is true
+	// +optional
+	CustomDetectorsConfig *string `json:"customDetectorsConfig,omitempty"`
 	// Boolean flag to enable/disable the guardrails sidecar gateway
 	// +optional
 	EnableGuardrailsGateway bool `json:"enableGuardrailsGateway,omitempty"`
@@ -45,32 +63,35 @@ type GuardrailsOrchestratorSpec struct {
 	SidecarGatewayConfig *string `json:"guardrailsGatewayConfig,omitempty"`
 	// List of orchestrator enviroment variables for configuring the OTLP exporter
 	// +optional
-	OtelExporter OtelExporter `json:"otelExporter,omitempty"`
+	OTelExporter OTelExporter `json:"otelExporter,omitempty"`
+	// Set log level in the orchestrator deployment
+	// +optional
+	LogLevel *string `json:"logLevel,omitempty"`
+	// Define TLS secrets to be mounted to the orchestrator. Secrets will be mounted at /etc/tls/$SECRET_NAME
+	// +optional
+	TLSSecrets *[]string `json:"tlsSecrets,omitempty"`
 }
 
-// OtelExporter defines the environment variables for configuring the OTLP exporter.
-type OtelExporter struct {
-	// Sets the protocol for all the OTLP endpoints
+// OTelExporter defines the environment variables for configuring the OTLP exporter.
+type OTelExporter struct {
+	// Sets the protocol for both traces and metrics
 	// +optional
-	Protocol string `json:"protocol,omitempty"`
-	// Overrides the protocol for traces
-	// +optional
-	TracesProtocol string `json:"tracesProtocol,omitempty"`
-	// Overrides the protocol for traces
-	// +optional
-	MetricsProtocol string `json:"metricsProtocol,omitempty"`
-	// Sets the OTLP endpoint
-	// +optional
-	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
-	// Overrides the OTLP endpoint for metrics
-	// +optional
-	MetricsEndpoint string `json:"metricsEndpoint,omitempty"`
+	// +kubebuilder:default=grpc
+	OTLPProtocol string `json:"otlpProtocol,omitempty"`
 	// Overrides the OTLP endpoint for traces
 	// +optional
-	TracesEndpoint string `json:"tracesEndpoint,omitempty"`
-	// Specifies which data types to export
+	OTLPTracesEndpoint string `json:"otlpTracesEndpoint,omitempty"`
+	// Overrides the OTLP endpoint for metrics
 	// +optional
-	OTLPExport string `json:"otlpExport,omitempty"`
+	OTLPMetricsEndpoint string `json:"otlpMetricsEndpoint,omitempty"`
+	// Specifies whether to enable tracing data export
+	// +optional
+	// +kubebuilder:default=true
+	EnableTraces bool `json:"enableTraces,omitempty"`
+	// Specifies whether to enable metrics data export
+	// +optional
+	// +kubebuilder:default=true
+	EnableMetrics bool `json:"enableMetrics,omitempty"`
 }
 
 type ConditionType string
@@ -90,12 +111,34 @@ type Condition struct {
 	LastTransitionTime metav1.Time `json:"lastTransitionTime" description:"last time the condition transit from one status to another"`
 }
 
+type DetectedService struct {
+	Name      string `json:"name,omitempty"`
+	Type      string `json:"type,omitempty"`   // e.g. "generator" or "detector"
+	Scheme    string `json:"scheme,omitempty"` //e.g., "http" or "https"
+	Hostname  string `json:"hostname,omitempty"`
+	Port      string `json:"port,omitempty"`
+	TLSSecret string `json:"tlsSecret,omitempty"`
+}
+
+type AutoConfigState struct {
+	GeneratedConfigMap        *string           `json:"generatedConfigMap,omitempty"`
+	GeneratedGatewayConfigMap *string           `json:"generatedGatewayConfigMap,omitempty"`
+	LastGenerated             string            `json:"lastGenerated,omitempty"`
+	GenerationService         DetectedService   `json:"generationService,omitempty"`
+	DetectorServices          []DetectedService `json:"detectorServices,omitempty"`
+	ConfigurationHash         string            `json:"configurationHash,omitempty"`
+	Status                    string            `json:"status,omitempty"`
+	Message                   string            `json:"message,omitempty"`
+}
+
 type GuardrailsOrchestratorStatus struct {
 	Phase string `json:"phase,omitempty"`
-
 	// Conditions describes the state of the GuardrailsOrchestrator resource.
 	// +optional
 	Conditions []Condition `json:"conditions,omitempty"`
+	// AutoConfigState describes information about the generated autoconfiguration
+	// +optional
+	AutoConfigState *AutoConfigState `json:"autoConfigState,omitempty"`
 }
 
 // +kubebuilder:object:root=true

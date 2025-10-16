@@ -56,9 +56,8 @@ func createGuardrailsOrchestrator(ctx context.Context, orchestratorConfigMap str
 	return err
 }
 
-func createGuardrailsOrchestratorSidecar(ctx context.Context, orchestratorConfigMap string) error {
+func createGuardrailsOrchestratorSidecar(ctx context.Context, orchestratorConfigMap string, guardrailsGatewayConfigMap string) error {
 	typedNamespacedName := types.NamespacedName{Name: orchestratorName, Namespace: namespaceName}
-	guardrailsGatewayConfigMap := "guardrails-gateway-config"
 	err := k8sClient.Get(ctx, typedNamespacedName, &gorchv1alpha1.GuardrailsOrchestrator{})
 	if err != nil && errors.IsNotFound(err) {
 		gorch := &gorchv1alpha1.GuardrailsOrchestrator{
@@ -81,10 +80,12 @@ func createGuardrailsOrchestratorSidecar(ctx context.Context, orchestratorConfig
 
 func createGuardrailsOrchestratorOtelExporter(ctx context.Context, orchestratorConfigMap string) error {
 	typedNamespacedName := types.NamespacedName{Name: orchestratorName, Namespace: namespaceName}
-	otelExporter := gorchv1alpha1.OtelExporter{
-		Protocol:     "grpc",
-		OTLPEndpoint: "localhost:4317",
-		OTLPExport:   "traces",
+	otelExporter := gorchv1alpha1.OTelExporter{
+		OTLPProtocol:        "grpc",
+		OTLPTracesEndpoint:  "localhost:4317",
+		OTLPMetricsEndpoint: "localhost:4318",
+		EnableTraces:        true,
+		EnableMetrics:       true,
 	}
 	err := k8sClient.Get(ctx, typedNamespacedName, &gorchv1alpha1.GuardrailsOrchestrator{})
 	if err != nil && errors.IsNotFound(err) {
@@ -96,7 +97,7 @@ func createGuardrailsOrchestratorOtelExporter(ctx context.Context, orchestratorC
 			Spec: gorchv1alpha1.GuardrailsOrchestratorSpec{
 				Replicas:           1,
 				OrchestratorConfig: &orchestratorConfigMap,
-				OtelExporter:       otelExporter,
+				OTelExporter:       otelExporter,
 			},
 		}
 		err = k8sClient.Create(ctx, gorch)
@@ -149,7 +150,7 @@ func testCreateDeleteGuardrailsOrchestrator(namespaceName string) {
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typedNamespacedName})
 		Expect(err).ToNot(HaveOccurred())
 
-		By("Checking if resources were successfully created in the reconcilation")
+		By("Checking if resources were successfully created in the reconciliation")
 		Eventually(func() error {
 			configMap := &corev1.ConfigMap{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: constants.ConfigMap, Namespace: namespaceName}, configMap); err != nil {
@@ -182,8 +183,8 @@ func testCreateDeleteGuardrailsOrchestrator(namespaceName string) {
 				return err
 			}
 			Expect(service.Namespace).Should(Equal(namespaceName))
-			Expect((service.Spec.Ports[0].Name)).Should(Equal("http"))
-			Expect((service.Spec.Ports[0].Port)).Should(Equal(int32(8033)))
+			Expect((service.Spec.Ports[0].Name)).Should(Equal("https"))
+			Expect((service.Spec.Ports[0].Port)).Should(Equal(int32(8032)))
 
 			route := &routev1.Route{}
 			if err := routev1.AddToScheme(scheme.Scheme); err != nil {
@@ -235,7 +236,7 @@ func testCreateDeleteGuardrailsOrchestratorSidecar(namespaceName string) {
 		By("Creating a custom resource for the GuardrailsOrchestrator")
 		ctx := context.Background()
 		typedNamespacedName := types.NamespacedName{Name: orchestratorName, Namespace: namespaceName}
-		err = createGuardrailsOrchestratorSidecar(ctx, configMap.Name)
+		err = createGuardrailsOrchestratorSidecar(ctx, orchestratorName+"-config", configMap.Name)
 		Expect(err).ToNot(HaveOccurred())
 
 		By("Checking if the custom resource was successfully created")
@@ -252,7 +253,7 @@ func testCreateDeleteGuardrailsOrchestratorSidecar(namespaceName string) {
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typedNamespacedName})
 		Expect(err).ToNot(HaveOccurred())
 
-		By("Checking if resources were successfully created in the reconcilation")
+		By("Checking if resources were successfully created in the reconciliation")
 		Eventually(func() error {
 			configMap := &corev1.ConfigMap{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: orchestratorName + "-config", Namespace: namespaceName}, configMap); err != nil {
@@ -270,6 +271,7 @@ func testCreateDeleteGuardrailsOrchestratorSidecar(namespaceName string) {
 			if err = k8sClient.Get(ctx, types.NamespacedName{Name: orchestratorName, Namespace: namespaceName}, deployment); err != nil {
 				return err
 			}
+
 			Expect(*deployment.Spec.Replicas).Should(Equal(int32(1)))
 			Expect(deployment.Namespace).Should(Equal(namespaceName))
 			Expect(deployment.Name).Should(Equal(orchestratorName))
@@ -285,7 +287,7 @@ func testCreateDeleteGuardrailsOrchestratorSidecar(namespaceName string) {
 				return err
 			}
 			Expect(service.Namespace).Should(Equal(namespaceName))
-			Expect(service.Spec.Ports[0].Name).Should(Equal("http"))
+			Expect(service.Spec.Ports[0].Name).Should(Equal("gateway"))
 			Expect(service.Spec.Ports[0].Port).Should(Equal(int32(8090)))
 
 			route := &routev1.Route{}
@@ -342,7 +344,7 @@ func testCreateDeleteGuardrailsOrchestratorOtelExporter(namespaceName string) {
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typedNamespacedName})
 		Expect(err).ToNot(HaveOccurred())
 
-		By("Checking if resources were successfully created in the reconcilation")
+		By("Checking if resources were successfully created in the reconciliation")
 		Eventually(func() error {
 			configMap := &corev1.ConfigMap{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: constants.ConfigMap, Namespace: namespaceName}, configMap); err != nil {
@@ -373,12 +375,15 @@ func testCreateDeleteGuardrailsOrchestratorOtelExporter(namespaceName string) {
 			envVar = getEnvVar("OTEL_EXPORTER_OTLP_PROTOCOL", container.Env)
 			Expect(envVar).ShouldNot(BeNil())
 			Expect(envVar.Value).To(Equal("grpc"))
-			envVar = getEnvVar("OTEL_EXPORTER_OTLP_ENDPOINT", container.Env)
+			envVar = getEnvVar("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", container.Env)
 			Expect(envVar).ShouldNot(BeNil())
 			Expect(envVar.Value).To(Equal("localhost:4317"))
+			envVar = getEnvVar("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", container.Env)
+			Expect(envVar).ShouldNot(BeNil())
+			Expect(envVar.Value).To(Equal("localhost:4318"))
 			envVar = getEnvVar("OTLP_EXPORT", container.Env)
 			Expect(envVar).ShouldNot(BeNil())
-			Expect(envVar.Value).To(Equal("traces"))
+			Expect(envVar.Value).To(Equal("traces,metrics"))
 
 			service := &corev1.Service{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: orchestratorName + "-service", Namespace: namespaceName}, service); err != nil {
