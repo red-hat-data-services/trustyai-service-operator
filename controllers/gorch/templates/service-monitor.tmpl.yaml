@@ -11,14 +11,9 @@ spec:
               key: ''
           honorLabels: true
           interval: 30s
-          metricRelabelings:
-              - action: keep
-                regex: trustyai_guardrails_.*
-                sourceLabels:
-                    - __name__
           path: /metrics
           scheme: http
-          port: detector-metrics
+          port: {{ .TargetPort }}
     selector:
         matchLabels:
             component: {{ .Orchestrator.Name }}

@@ -2,12 +2,12 @@ package tas
 
 import (
 	"context"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
 
 	trustyaiopendatahubiov1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/tas/v1alpha1"
 	"github.com/trustyai-explainability/trustyai-service-operator/controllers/constants"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	corev1 "k8s.io/api/core/v1"
@@ -85,31 +85,8 @@ func (r *TrustyAIServiceReconciler) createClusterRoleBinding(ctx context.Context
 		},
 	}
 
-	// Set instance as the owner of the ClusterRoleBinding
-	if err := controllerutil.SetControllerReference(instance, clusterRoleBinding, r.Scheme); err != nil {
+	if err := utils.ReconcileClusterRoleBinding(ctx, r.Client, instance, clusterRoleBinding); err != nil {
 		return err
 	}
-
-	// Check if this ClusterRoleBinding already exists
-	found := &rbacv1.ClusterRoleBinding{}
-	err := r.Get(ctx, types.NamespacedName{Name: clusterRoleBinding.Name}, found)
-	if err != nil && errors.IsNotFound(err) {
-		log.FromContext(ctx).Info("Creating a new ClusterRoleBinding", "Name", clusterRoleBinding.Name)
-		err = r.Create(ctx, clusterRoleBinding)
-		if err != nil {
-			if errors.IsAlreadyExists(err) {
-				log.FromContext(ctx).Info("ClusterRoleBinding already exists", "Name", clusterRoleBinding.Name)
-				return nil
-			}
-			log.FromContext(ctx).Error(err, "Error creating a new ClusterRoleBinding")
-			return err
-		}
-	} else if err == nil {
-		log.FromContext(ctx).V(1).Info("ClusterRoleBinding already exists", "Name", clusterRoleBinding.Name)
-	} else {
-		log.FromContext(ctx).Error(err, "Error checking for existing ClusterRoleBinding")
-		return err
-	}
-
 	return nil
 }
