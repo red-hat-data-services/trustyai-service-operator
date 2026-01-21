@@ -15,7 +15,8 @@ ENV PATH="/opt/app-root/bin:/opt/app-root/src/.local/bin/:/opt/app-root/src/bin:
 # Clone the Git repository, check out v0.4.4 and install the Python package
 RUN git clone https://github.com/opendatahub-io/lm-evaluation-harness.git && \
     cd lm-evaluation-harness &&  git checkout release-0.4.5 && \
-    pip install --no-cache-dir --user -e .[api,ibm_watsonx_ai]
+    pip install --no-cache-dir --user -e .[api,ibm_watsonx_ai] && \
+    pip install --no-cache-dir --user --upgrade 'urllib3>=2.6.3,<3' 'ibm-cos-sdk-core>=2.16.0' 'ibm-cos-sdk>=2.16.0' 'ibm-cos-sdk-s3transfer>=2.16.0'
 
 RUN git clone --branch odh-2.22 https://github.com/opendatahub-io/hf-evaluate.git /tmp/evaluate && \
     cp -R /tmp/evaluate/metrics/. . && \
