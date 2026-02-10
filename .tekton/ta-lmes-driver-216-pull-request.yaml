@@ -7,14 +7,14 @@ metadata:
     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
     build.appstudio.redhat.com/pull_request_number: "{{pull_request_number}}"
     pipelinesascode.tekton.dev/max-keep-runs: "3"
-    pipelinesascode.tekton.dev/on-comment: "^/build-konflux trustyai-service-operator"
+    pipelinesascode.tekton.dev/on-comment: "^/build-konflux ta-lmes-driver"
     pipelinesascode.tekton.dev/on-event: "[pull_request]"
     pipelinesascode.tekton.dev/cancel-in-progress: "true"
   labels:
     appstudio.openshift.io/application: automation
-    appstudio.openshift.io/component: pull-request-pipelines-odh-trustyai-service-operator-v2-16
+    appstudio.openshift.io/component: pull-request-pipelines-ta-lmes-driver-216
     pipelines.appstudio.openshift.io/type: build
-  name: odh-trustyai-service-operator-v2-16-on-pull-request
+  name: ta-lmes-driver-216-on-pull-request
   namespace: rhoai-tenant
 spec:
   params:
@@ -29,24 +29,21 @@ spec:
   - name: additional-labels
     value:
     - version=on-pr-{{revision}}
-    - io.openshift.tags=odh-trustyai-service-operator-v2-16
+    - io.openshift.tags=ta-lmes-driver-216
   - name: output-image
-    value: quay.io/rhoai/pull-request-pipelines:odh-trustyai-service-operator-v2-16-{{revision}}
+    value: quay.io/rhoai/pull-request-pipelines:ta-lmes-driver-216-{{revision}}
   - name: dockerfile
-    value: Dockerfile.konflux
-  - name: path-context
-    value: .
+    value: Dockerfile.driver
   - name: hermetic
-    value: "true"
-  - name: prefetch-input
-    value: |
-      {"type": "gomod", "path": "."}
+    value: "false"
   - name: build-source-image
-    value: "true"
+    value: "false"
   - name: build-image-index
     value: "false"
-  - name: enable-slack-failure-notification
-    value: "false"
+  - name: rebuild
+    value: true
+  - name: skip-checks
+    value: "true"
   - name: image-expires-after
     value: 5d
   - name: rhoai-version
