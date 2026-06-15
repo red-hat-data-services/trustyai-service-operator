@@ -149,6 +149,15 @@ All controllers follow the standard loop:
 - Events via `recorder.Event(instance, EventType, reason, message)`
 - Sub-reconcilers (TAS pattern): separate functions with signature `func(ctx, req, instance) (*Result, error)`
 
+### EvalHub Metrics Architecture
+
+EvalHub exposes Prometheus metrics on a **dedicated port (9090)** bound to `0.0.0.0`, separate from the API (port 8444, loopback only, behind kube-rbac-proxy on 8443). The operator creates:
+
+- A **metrics Service** (`<name>-metrics`, ClusterIP, port 9090, no TLS) — `metrics_service.go`
+- A **ServiceMonitor** targeting the metrics Service over plain HTTP — `servicemonitor.go`
+
+The metrics port requires no authentication, is cluster-internal only (no Route), and is reachable by Prometheus via existing namespace NetworkPolicies. The `METRICS_PORT` and `METRICS_HOST` env vars are set on the EvalHub container and protected from CR overrides.
+
 ### Scheme Registration (cmd/main.go init())
 
 Registers all API groups in order:
@@ -195,6 +204,40 @@ make generate       # controller-gen object:headerFile="hack/boilerplate.go.txt"
 GitHub Actions in `.github/workflows/`:
 - `controller-tests.yaml` — runs `make test`
 - `lint-yaml.yaml` — yamllint on `config/**/*.yaml`
+- `conftest.yaml` — OPA manifest policy checks against all kustomize overlays
 - `gosec.yaml` — security scanning (SARIF output)
 - `smoke.yaml` — smoke tests
+- `operator-chaos.yml` — shift-left upgrade validation (L1: knowledge model + CRD diff)
 - `.dependabot.yml` — auto-updates Go deps
+
+## Shift-left Upgrade Validation (operator-chaos)
+
+L1 integration using [operator-chaos](https://github.com/opendatahub-io/operator-chaos). Catches breaking CRD schema changes and knowledge model regressions at PR time without a cluster.
+
+```text
+chaos/knowledge/trustyai.yaml   # Knowledge model (operator control plane topology)
+.github/workflows/operator-chaos.yml  # GHA workflow
+```
+
+The knowledge model covers the **operator control plane only** — the Deployment, RBAC, ServiceAccount, leader election, and ServiceMonitor. Per-CR workloads (TrustyAIService instances, EvalHub instances, etc.) are dynamic user-created resources and are not modelled.
+
+When modifying CRDs (`api/` types → `make manifests`) or RBAC/manager resources, the workflow automatically validates that no breaking changes are introduced. Update `chaos/knowledge/trustyai.yaml` whenever the operator's own managed resources change (new RBAC roles, renamed resources, etc.).
+
+## Manifest Policies (Conftest/OPA)
+
+OPA/Rego policies in `policy/` are evaluated against rendered kustomize manifests on every push/PR. The CI renders all 9 kustomize entry points (base + 8 overlays) and checks each.
+
+```bash
+make policy-test    # OPA unit tests only
+make policy-check   # Full check against all overlays
+```
+
+**Current policies:**
+- `policy/rbac.rego` — closed allowlist of expected `ClusterRoleBinding` resources. Any CRB not in `expected_crbs` or binding the wrong `ClusterRole` is denied.
+
+**When adding RBAC resources:**
+- If you add a new `ClusterRoleBinding` (e.g. in a component's `rbac/` directory), you must add its post-kustomize name and expected `ClusterRole` to `expected_crbs` in `policy/rbac.rego`.
+- Overlays that apply `namePrefix: trustyai-service-operator-` produce prefixed names; `base` and `evalhub-only` produce un-prefixed names. Both must be allowlisted if applicable.
+- Run `make policy-check` locally before pushing.
+
+See `policy/README.md` for full details.
