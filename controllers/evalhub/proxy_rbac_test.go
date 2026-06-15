@@ -6,7 +6,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	evalhubv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1alpha1"
+	evalhubv1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,7 +25,7 @@ var _ = Describe("EvalHub API RBAC", func() {
 		testNamespace     string
 		operatorNamespace string
 		namespace         *corev1.Namespace
-		evalHub           *evalhubv1alpha1.EvalHub
+		evalHub           *evalhubv1.EvalHub
 		reconciler        *EvalHubReconciler
 		operatorNS        *corev1.Namespace
 		operatorCM        *corev1.ConfigMap
@@ -291,6 +291,18 @@ var _ = Describe("EvalHub API RBAC", func() {
 			Expect(jcRB.RoleRef.Name).To(Equal(jobConfigClusterRoleName))
 			Expect(jcRB.Subjects).To(HaveLen(1))
 			Expect(jcRB.Subjects[0].Name).To(Equal(evalHubName + "-service"))
+
+			By("Verifying hardware-profiles-reader RoleBinding exists")
+			hpRB := &rbacv1.RoleBinding{}
+			err = k8sClient.Get(ctx, types.NamespacedName{
+				Name:      evalHubName + "-hardware-profiles-reader-rb",
+				Namespace: testNamespace,
+			}, hpRB)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hpRB.RoleRef.Kind).To(Equal("ClusterRole"))
+			Expect(hpRB.RoleRef.Name).To(Equal(hardwareProfilesReaderClusterRoleName))
+			Expect(hpRB.Subjects).To(HaveLen(1))
+			Expect(hpRB.Subjects[0].Name).To(Equal(evalHubName + "-service"))
 
 			By("Verifying providers-access RoleBinding exists")
 			pRB := &rbacv1.RoleBinding{}

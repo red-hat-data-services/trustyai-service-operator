@@ -2,8 +2,9 @@ package evalhub
 
 import (
 	"context"
+	"fmt"
 
-	evalhubv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1alpha1"
+	evalhubv1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -22,7 +23,7 @@ const (
 // reconcileTenantNamespaces lists all namespaces with the tenant label and ensures
 // the job ServiceAccount and API SA RoleBindings exist in each one. It also
 // removes stale resources from namespaces that no longer carry the tenant label.
-func (r *EvalHubReconciler) reconcileTenantNamespaces(ctx context.Context, instance *evalhubv1alpha1.EvalHub) error {
+func (r *EvalHubReconciler) reconcileTenantNamespaces(ctx context.Context, instance *evalhubv1.EvalHub) error {
 	log := log.FromContext(ctx)
 
 	// List namespaces with the tenant label
@@ -77,10 +78,29 @@ func (r *EvalHubReconciler) reconcileTenantNamespaces(ctx context.Context, insta
 			return err
 		}
 
+		// Create hardware-profiles-reader RoleBinding for the API SA in the tenant
+		// namespace so the EvalHub service can list and read HardwareProfile CRs there.
+		hardwareProfilesRBName := normalizeDNS1123LabelValue(instance.Name + "-" + ns + "-hardware-profiles-reader-rb")
+		if err := r.createJobRoleBinding(ctx, instance, hardwareProfilesRBName, serviceAccountName, ns, rbacv1.RoleRef{
+			Kind:     "ClusterRole",
+			Name:     hardwareProfilesReaderClusterRoleName,
+			APIGroup: rbacv1.GroupName,
+		}, instance.Namespace); err != nil {
+			log.Error(err, "Failed to create hardware-profiles-reader RoleBinding in tenant namespace", "namespace", ns)
+			return err
+		}
+
 		// Create service CA ConfigMap in the tenant namespace so job pods can
 		// mount the cluster service CA for TLS callbacks to EvalHub.
 		if err := r.createTenantServiceCAConfigMap(ctx, instance, ns); err != nil {
 			log.Error(err, "Failed to create service CA ConfigMap in tenant namespace", "namespace", ns)
+			return err
+		}
+
+		// Inject this instance's service URL into the shared discovery ConfigMap so clients
+		// can resolve it from within the tenant namespace without cross-namespace lookups.
+		if err := r.reconcileDiscoveryConfigMap(ctx, instance, ns); err != nil {
+			log.Error(err, "Failed to reconcile discovery ConfigMap in tenant namespace", "namespace", ns)
 			return err
 		}
 	}
@@ -93,12 +113,19 @@ func (r *EvalHubReconciler) reconcileTenantNamespaces(ctx context.Context, insta
 		return err
 	}
 
+	// Remove this instance's URL key from discovery ConfigMaps in namespaces that
+	// are no longer active tenants. Deletes the CM if it becomes empty.
+	if err := r.cleanupDiscoveryConfigMaps(ctx, instance, activeTenants); err != nil {
+		log.Error(err, "Failed to clean up discovery ConfigMaps")
+		return err
+	}
+
 	return nil
 }
 
 // cleanupStaleTenantResources removes job ServiceAccounts, RoleBindings, Roles,
 // and ConfigMaps from namespaces that no longer carry the tenant label.
-func (r *EvalHubReconciler) cleanupStaleTenantResources(ctx context.Context, instance *evalhubv1alpha1.EvalHub, activeTenants map[string]bool) error {
+func (r *EvalHubReconciler) cleanupStaleTenantResources(ctx context.Context, instance *evalhubv1.EvalHub, activeTenants map[string]bool) error {
 	log := log.FromContext(ctx)
 	selector := client.MatchingLabels{
 		"eval-hub.trustyai.opendatahub.io": jobResourceInstanceID(instance),
@@ -175,7 +202,7 @@ func (r *EvalHubReconciler) cleanupStaleTenantResources(ctx context.Context, ins
 // createTenantServiceCAConfigMap ensures a service CA ConfigMap exists in the
 // tenant namespace. The ConfigMap is annotated so that OpenShift's service CA
 // operator automatically injects the cluster CA bundle.
-func (r *EvalHubReconciler) createTenantServiceCAConfigMap(ctx context.Context, instance *evalhubv1alpha1.EvalHub, namespace string) error {
+func (r *EvalHubReconciler) createTenantServiceCAConfigMap(ctx context.Context, instance *evalhubv1.EvalHub, namespace string) error {
 	log := log.FromContext(ctx)
 	cmName := instance.Name + "-service-ca"
 
@@ -210,4 +237,76 @@ func (r *EvalHubReconciler) createTenantServiceCAConfigMap(ctx context.Context, 
 	}
 	log.Info("Creating service CA ConfigMap in tenant namespace", "namespace", namespace, "name", cmName)
 	return r.Create(ctx, cm)
+}
+
+// reconcileDiscoveryConfigMap upserts the well-known "evalhub-discovery" ConfigMap in
+// namespace, setting a key "{instance.Name}.url" to the service URL of this instance.
+// Multiple EvalHub instances share the same ConfigMap; each owns exactly one key.
+func (r *EvalHubReconciler) reconcileDiscoveryConfigMap(ctx context.Context, instance *evalhubv1.EvalHub, namespace string) error {
+	log := log.FromContext(ctx)
+	serviceURL := fmt.Sprintf("https://%s.%s.svc.cluster.local:%d",
+		instance.Name, instance.Namespace, servicePort)
+	urlKey := instance.Name + ".url"
+
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, client.ObjectKey{Name: discoveryConfigMapName, Namespace: namespace}, cm)
+	if err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+	if errors.IsNotFound(err) {
+		cm = &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      discoveryConfigMapName,
+				Namespace: namespace,
+				Labels:    map[string]string{discoveryConfigMapLabel: "true"},
+			},
+			Data: map[string]string{urlKey: serviceURL},
+		}
+		log.Info("Creating discovery ConfigMap in tenant namespace", "namespace", namespace)
+		return r.Create(ctx, cm)
+	}
+	if cm.Data == nil {
+		cm.Data = make(map[string]string)
+	}
+	if cm.Data[urlKey] != serviceURL {
+		cm.Data[urlKey] = serviceURL
+		return r.Update(ctx, cm)
+	}
+	return nil
+}
+
+// cleanupDiscoveryConfigMaps removes the "{instance.Name}.url" key from the discovery
+// ConfigMap in any namespace that is no longer an active tenant. If the removal empties
+// the ConfigMap it is deleted entirely.
+func (r *EvalHubReconciler) cleanupDiscoveryConfigMaps(ctx context.Context, instance *evalhubv1.EvalHub, activeTenants map[string]bool) error {
+	log := log.FromContext(ctx)
+	urlKey := instance.Name + ".url"
+
+	cmList := &corev1.ConfigMapList{}
+	if err := r.List(ctx, cmList, client.MatchingLabels{discoveryConfigMapLabel: "true"}); err != nil {
+		return err
+	}
+	for i := range cmList.Items {
+		cm := &cmList.Items[i]
+		ns := cm.Namespace
+		if ns == instance.Namespace || activeTenants[ns] {
+			continue
+		}
+		if _, hasKey := cm.Data[urlKey]; !hasKey {
+			continue
+		}
+		delete(cm.Data, urlKey)
+		if len(cm.Data) == 0 {
+			log.Info("Deleting empty discovery ConfigMap", "namespace", ns)
+			if err := r.Delete(ctx, cm); err != nil && !errors.IsNotFound(err) {
+				return err
+			}
+		} else {
+			log.Info("Removing stale URL key from discovery ConfigMap", "namespace", ns, "key", urlKey)
+			if err := r.Update(ctx, cm); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

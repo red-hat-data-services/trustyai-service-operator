@@ -37,9 +37,55 @@ Issues are tracked using [Github](https://github.com/trustyai-explainability/tru
 To ensure the contributed code adheres to the project goals, we have set up some automated quality gates:
 
 1. [linters](https://github.com/trustyai-explainability/trustyai-service-operator/actions/workflows/lint-yaml.yaml): Ensure the check for linters is successful.
-2. [smoke tests](https://github.com/trustyai-explainability/trustyai-service-operator/actions/workflows/smoke.yaml): Ensure the operator passes the smoke tests
-3. [unit-tests](https://github.com/trustyai-explainability/trustyai-service-operator/actions/workflows/controller-tests.yaml): Ensure unit tests pass.
-4. e2e-tests: Ensure OpenShift CI job for e2e tests pass.
+2. [manifest policy check](https://github.com/trustyai-explainability/trustyai-service-operator/actions/workflows/conftest.yaml): Ensure rendered manifests pass all OPA policies (see `policy/README.md`).
+3. [smoke tests](https://github.com/trustyai-explainability/trustyai-service-operator/actions/workflows/smoke.yaml): Ensure the operator passes the smoke tests
+4. [unit-tests](https://github.com/trustyai-explainability/trustyai-service-operator/actions/workflows/controller-tests.yaml): Ensure unit tests pass.
+5. [operator-chaos](https://github.com/trustyai-explainability/trustyai-service-operator/actions/workflows/operator-chaos.yml): Ensure no breaking upgrade changes are introduced.
+6. e2e-tests: Ensure OpenShift CI job for e2e tests pass.
+
+### Shift-left Upgrade Validation (operator-chaos)
+
+This operator uses [operator-chaos](https://github.com/opendatahub-io/operator-chaos) for shift-left upgrade validation. A GitHub Actions workflow runs on every PR that touches operator code, CRDs, or the knowledge model to catch breaking changes before merge.
+
+**What it checks:**
+- Knowledge model validity and structural regressions
+- CRD schema breaking changes across all 5 CRDs
+- Simulated upgrade dry-run
+
+**Maintaining the knowledge model:**
+
+The knowledge model at `chaos/knowledge/trustyai.yaml` describes the operator's control plane topology. Update it when:
+- Adding or removing RBAC resources
+- Renaming the operator deployment or service account
+- Changing the leader election lease name
+- Adding new operator-level resources (not per-CR workloads)
+
+```bash
+# Validate locally
+go install github.com/opendatahub-io/operator-chaos/cmd/operator-chaos@9e6ac9668b9aaca2f0f2ddf169867862b7925b80
+operator-chaos validate --knowledge chaos/knowledge/trustyai.yaml
+operator-chaos preflight --knowledge chaos/knowledge/trustyai.yaml --local
+```
+
+### Manifest Policies (Conftest/OPA)
+
+Rendered kustomize manifests are checked against [OPA/Rego](https://www.openpolicyagent.org/) policies in `policy/` using [Conftest](https://www.conftest.dev/). The CI workflow tests **all** kustomize entry points (base + every overlay).
+
+**Current policies:**
+- **RBAC allowlist** (`policy/rbac.rego`): a closed allowlist of expected `ClusterRoleBinding` resources. Any new or unexpected CRB will fail CI.
+
+**If your PR introduces a new `ClusterRoleBinding`:**
+1. Add the post-kustomize CRB name and its expected `ClusterRole` to `expected_crbs` in `policy/rbac.rego`.
+2. Run `make policy-check` locally to verify.
+3. Explain in the PR description why a `ClusterRoleBinding` is required rather than a namespace-scoped `RoleBinding`.
+
+See `policy/README.md` for full details on running and extending policies.
+
+```bash
+# Run locally
+make policy-test    # OPA unit tests
+make policy-check   # Full check against all overlays
+```
 
 ### Code Style Guidelines
 
