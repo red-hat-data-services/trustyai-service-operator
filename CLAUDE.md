@@ -151,9 +151,9 @@ All controllers follow the standard loop:
 
 ### EvalHub Metrics Architecture
 
-EvalHub exposes Prometheus metrics on a **dedicated port (9090)** bound to `0.0.0.0`, separate from the API (port 8444, loopback only, behind kube-rbac-proxy on 8443). The operator creates:
+EvalHub exposes Prometheus metrics on a **dedicated port (8081)** bound to `0.0.0.0`, separate from the API (port 8444, loopback only, behind kube-rbac-proxy on 8443). The operator creates:
 
-- A **metrics Service** (`<name>-metrics`, ClusterIP, port 9090, no TLS) — `metrics_service.go`
+- A **metrics Service** (`<name>-metrics`, ClusterIP, port 8081, no TLS) — `metrics_service.go`
 - A **ServiceMonitor** targeting the metrics Service over plain HTTP — `servicemonitor.go`
 
 The metrics port requires no authentication, is cluster-internal only (no Route), and is reachable by Prometheus via existing namespace NetworkPolicies. The `METRICS_PORT` and `METRICS_HOST` env vars are set on the EvalHub container and protected from CR overrides.
@@ -234,9 +234,11 @@ make policy-check   # Full check against all overlays
 
 **Current policies:**
 - `policy/rbac.rego` — closed allowlist of expected `ClusterRoleBinding` resources. Any CRB not in `expected_crbs` or binding the wrong `ClusterRole` is denied.
+- `policy/clusterrole.rego` — inspects ClusterRole **contents**: (1) closed allowlist of permitted `(apiGroup, resource)` pairs, (2) denylist blocking wildcards, secrets write, privilege escalation verbs. Manager roles that legitimately need secrets or CRB write (TAS, GORCH, nemo-guardrails, evalhub) are exempt by name suffix — see `policy/README.md` for the full exemption list.
 
 **When adding RBAC resources:**
 - If you add a new `ClusterRoleBinding` (e.g. in a component's `rbac/` directory), you must add its post-kustomize name and expected `ClusterRole` to `expected_crbs` in `policy/rbac.rego`.
+- If you add a new `(apiGroup, resource)` pair to any ClusterRole, you must add it to `allowed_api_resources` in `policy/clusterrole.rego`.
 - Overlays that apply `namePrefix: trustyai-service-operator-` produce prefixed names; `base` and `evalhub-only` produce un-prefixed names. Both must be allowlisted if applicable.
 - Run `make policy-check` locally before pushing.
 
