@@ -1470,6 +1470,7 @@ func getMainSecurityContext(securityContext *corev1.SecurityContext) *corev1.Sec
 		caps := *merged.Capabilities
 		merged.Capabilities = &caps
 	}
+	merged.Capabilities.Add = nil
 	hasDropAll := false
 	for _, cap := range merged.Capabilities.Drop {
 		if cap == "ALL" {
