@@ -1371,6 +1371,7 @@ func CreatePod(svcOpts *serviceOptions, job *lmesv1alpha1.LMEvalJob, permConfig 
 	copy(filteredSidecars, rawSidecars)
 	for i := range filteredSidecars {
 		filteredSidecars[i].Env = removeProtectedEnvVars(filteredSidecars[i].Env)
+		filteredSidecars[i].SecurityContext = getMainSecurityContext(filteredSidecars[i].SecurityContext)
 	}
 	containers = append(containers, filteredSidecars...)
 
