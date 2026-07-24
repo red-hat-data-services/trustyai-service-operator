@@ -78,6 +78,7 @@ type TrustyAIServiceReconciler struct {
 //+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;create;update
 //+kubebuilder:rbac:groups=networking.istio.io,resources=destinationrules,verbs=create;list;watch;get;update;patch;delete
 //+kubebuilder:rbac:groups=networking.istio.io,resources=virtualservices,verbs=create;list;watch;get;update;patch;delete
+//+kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=create;get;list;watch;update
 //+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=list;watch;get
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -156,6 +157,11 @@ func (r *TrustyAIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	if !shouldContinue {
 		return RequeueWithDelayMessage(ctx, time.Minute, "Not all replicas are ready, requeue the reconcile request")
+	}
+
+	err = r.ensureNetworkPolicy(ctx, instance)
+	if err != nil {
+		return RequeueWithErrorMessage(ctx, err, "Failed to ensure NetworkPolicy")
 	}
 
 	if instance.Spec.Storage.IsStoragePVC() || instance.IsMigration() {
