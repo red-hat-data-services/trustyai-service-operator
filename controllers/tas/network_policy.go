@@ -148,6 +148,21 @@ func (r *TrustyAIServiceReconciler) networkPolicyNeedsUpdate(existing *networkin
 	if len(kserveRule.Ports) != 2 {
 		return true
 	}
+	prometheusRule := existing.Spec.Ingress[1]
+	if len(prometheusRule.From) != 1 || prometheusRule.From[0].NamespaceSelector == nil {
+		return true
+	}
+	nsExprs := prometheusRule.From[0].NamespaceSelector.MatchExpressions
+	if len(nsExprs) != 1 || nsExprs[0].Key != "kubernetes.io/metadata.name" || nsExprs[0].Operator != metav1.LabelSelectorOpIn {
+		return true
+	}
+	expectedNS := []string{"openshift-monitoring", "openshift-user-workload-monitoring"}
+	if !reflect.DeepEqual(nsExprs[0].Values, expectedNS) {
+		return true
+	}
+	if len(prometheusRule.Ports) != 1 {
+		return true
+	}
 	oauthRule := existing.Spec.Ingress[2]
 	if len(oauthRule.From) != 0 {
 		return true
