@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	lmesv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/lmes/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // ValidateJSON checks that the input is a valid standalone JSON
@@ -124,6 +125,14 @@ func ValidateUserInput(job *lmesv1alpha1.LMEvalJob) error {
 		if err := ValidateBatchSizeInput(*job.Spec.BatchSize); err != nil {
 			return fmt.Errorf("invalid batch size: %w", err)
 		}
+	}
+
+	if err := ValidatePodVolumes(job.Spec.Pod.GetVolumes()); err != nil {
+		return fmt.Errorf("invalid pod volumes: %w", err)
+	}
+
+	if err := ValidateSidecars(job.Spec.Pod.GetSideCards()); err != nil {
+		return fmt.Errorf("invalid sidecar: %w", err)
 	}
 
 	// Validate custom task git source
@@ -561,6 +570,37 @@ func ValidateOCIPath(path string) error {
 		return fmt.Errorf("OCI path contains invalid characters (only alphanumeric, ., _, /, - allowed)")
 	}
 
+	return nil
+}
+
+// ValidatePodVolumes rejects hostPath volumes.
+func ValidatePodVolumes(volumes []corev1.Volume) error {
+	for i, vol := range volumes {
+		if vol.VolumeSource.HostPath != nil {
+			return fmt.Errorf("volume[%d] %q: hostPath volumes are not permitted", i, vol.Name)
+		}
+	}
+	return nil
+}
+
+// ValidateContainerImage rejects empty or shell-metachar-containing image names.
+func ValidateContainerImage(image string) error {
+	if image == "" {
+		return fmt.Errorf("container image cannot be empty")
+	}
+	if ContainsShellMetacharacters(image) {
+		return fmt.Errorf("container image %q contains invalid characters", image)
+	}
+	return nil
+}
+
+// ValidateSidecars validates sidecar image names.
+func ValidateSidecars(sidecars []corev1.Container) error {
+	for i, c := range sidecars {
+		if err := ValidateContainerImage(c.Image); err != nil {
+			return fmt.Errorf("sidecar[%d]: %w", i, err)
+		}
+	}
 	return nil
 }
 
