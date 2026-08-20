@@ -337,8 +337,12 @@ func Test_WithCustomPod(t *testing.T) {
 					Command:         generateCmd(svcOpts, job, NewDefaultPermissionConfig()),
 					Args:            generateArgs(svcOpts, job, log),
 					SecurityContext: &corev1.SecurityContext{
-						RunAsUser:  &runAsUser,
-						RunAsGroup: &runAsGroup,
+						RunAsUser:                &runAsUser,
+						RunAsGroup:               &runAsGroup,
+						AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+						Capabilities: &corev1.Capabilities{
+							Drop: []corev1.Capability{"ALL"},
+						},
 					},
 					Ports: []corev1.ContainerPort{
 						{
@@ -415,6 +419,9 @@ func Test_WithCustomPod(t *testing.T) {
 			},
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: &runAsNonRootUser,
+				SeccompProfile: &corev1.SeccompProfile{
+					Type: corev1.SeccompProfileTypeRuntimeDefault,
+				},
 			},
 			Volumes: []corev1.Volume{
 				{
@@ -3845,4 +3852,178 @@ func Test_AllowCodeExecution(t *testing.T) {
 
 	args := generateArgs(svcOpts, job, log)
 	assert.Contains(t, args, "--confirm_run_unsafe_code")
+}
+
+func Test_ValidatePodVolumes(t *testing.T) {
+	hostPathType := corev1.HostPathDirectory
+	tests := []struct {
+		name    string
+		volumes []corev1.Volume
+		wantErr bool
+	}{
+		{
+			name:    "no volumes",
+			volumes: nil,
+			wantErr: false,
+		},
+		{
+			name: "PVC volume allowed",
+			volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "mypvc"},
+				},
+			}},
+			wantErr: false,
+		},
+		{
+			name: "hostPath volume rejected",
+			volumes: []corev1.Volume{{
+				Name: "host",
+				VolumeSource: corev1.VolumeSource{
+					HostPath: &corev1.HostPathVolumeSource{Path: "/etc", Type: &hostPathType},
+				},
+			}},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidatePodVolumes(tt.volumes)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func Test_ValidateSidecars(t *testing.T) {
+	tests := []struct {
+		name     string
+		sidecars []corev1.Container
+		wantErr  bool
+	}{
+		{name: "no sidecars", sidecars: nil, wantErr: false},
+		{name: "valid image", sidecars: []corev1.Container{{Name: "s", Image: "busybox:latest"}}, wantErr: false},
+		{name: "empty image", sidecars: []corev1.Container{{Name: "s", Image: ""}}, wantErr: true},
+		{name: "shell metachar in image", sidecars: []corev1.Container{{Name: "s", Image: "img;rm -rf /"}}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSidecars(tt.sidecars)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func Test_SidecarProtectedEnvVarsStripped(t *testing.T) {
+	log := log.FromContext(context.Background())
+	svcOpts := &serviceOptions{
+		PodImage:        "podimage:latest",
+		DriverImage:     "driver:latest",
+		ImagePullPolicy: corev1.PullAlways,
+	}
+	job := &lmesv1alpha1.LMEvalJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "for-testing"},
+		TypeMeta:   metav1.TypeMeta{Kind: lmesv1alpha1.KindName, APIVersion: lmesv1alpha1.Version},
+		Spec: lmesv1alpha1.LMEvalJobSpec{
+			Model:    "hf",
+			TaskList: lmesv1alpha1.TaskList{TaskNames: []string{"task1"}},
+			Pod: &lmesv1alpha1.LMEvalPodSpec{
+				SideCars: []corev1.Container{
+					{
+						Name:  "spy",
+						Image: "busybox",
+						Env: []corev1.EnvVar{
+							{Name: "TRUST_REMOTE_CODE", Value: "1"},
+							{Name: "HF_DATASETS_TRUST_REMOTE_CODE", Value: "1"},
+							{Name: "SAFE_VAR", Value: "ok"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pod := CreatePod(svcOpts, job, NewDefaultPermissionConfig(), log)
+	require.Len(t, pod.Spec.Containers, 2, "should have main + sidecar")
+	sidecar := pod.Spec.Containers[1]
+	for _, env := range sidecar.Env {
+		assert.NotEqual(t, "TRUST_REMOTE_CODE", env.Name, "protected var must be stripped from sidecar")
+		assert.NotEqual(t, "HF_DATASETS_TRUST_REMOTE_CODE", env.Name, "protected var must be stripped from sidecar")
+	}
+	envNames := make([]string, 0, len(sidecar.Env))
+	for _, e := range sidecar.Env {
+		envNames = append(envNames, e.Name)
+	}
+	assert.Contains(t, envNames, "SAFE_VAR", "non-protected var must be preserved")
+}
+
+func Test_SecurityContextMerge(t *testing.T) {
+	runAsUser := int64(1000)
+
+	t.Run("main ctx nil returns default", func(t *testing.T) {
+		merged := getMainSecurityContext(nil)
+		assert.Equal(t, defaultSecurityContext, merged)
+	})
+
+	t.Run("main ctx without capabilities gets DROP ALL added", func(t *testing.T) {
+		userCtx := &corev1.SecurityContext{RunAsUser: &runAsUser}
+		merged := getMainSecurityContext(userCtx)
+		assert.Equal(t, &runAsUser, merged.RunAsUser, "user field preserved")
+		assert.False(t, *merged.AllowPrivilegeEscalation, "AllowPrivilegeEscalation always false")
+		require.NotNil(t, merged.Capabilities)
+		assert.Contains(t, merged.Capabilities.Drop, corev1.Capability("ALL"), "DROP ALL always present")
+	})
+
+	t.Run("main ctx with capabilities but no DROP ALL gets it appended", func(t *testing.T) {
+		userCtx := &corev1.SecurityContext{
+			RunAsUser: &runAsUser,
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"NET_RAW"},
+			},
+		}
+		merged := getMainSecurityContext(userCtx)
+		assert.Contains(t, merged.Capabilities.Drop, corev1.Capability("ALL"), "DROP ALL appended")
+		assert.Contains(t, merged.Capabilities.Drop, corev1.Capability("NET_RAW"), "existing drop preserved")
+		assert.NotContains(t, userCtx.Capabilities.Drop, corev1.Capability("ALL"), "original not mutated")
+	})
+
+	t.Run("main ctx with DROP ALL already present does not duplicate", func(t *testing.T) {
+		userCtx := &corev1.SecurityContext{
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+		}
+		merged := getMainSecurityContext(userCtx)
+		count := 0
+		for _, cap := range merged.Capabilities.Drop {
+			if cap == "ALL" {
+				count++
+			}
+		}
+		assert.Equal(t, 1, count, "ALL must appear exactly once")
+	})
+
+	t.Run("pod ctx nil returns default", func(t *testing.T) {
+		merged := getPodSecurityContext(nil)
+		assert.Equal(t, defaultPodSecurityContext, merged)
+	})
+
+	t.Run("pod ctx merges user fields and enforces baseline", func(t *testing.T) {
+		fsGroup := int64(2000)
+		userPodCtx := &corev1.PodSecurityContext{FSGroup: &fsGroup}
+		merged := getPodSecurityContext(userPodCtx)
+		assert.Equal(t, &fsGroup, merged.FSGroup, "user field preserved")
+		assert.True(t, *merged.RunAsNonRoot, "RunAsNonRoot always true")
+		require.NotNil(t, merged.SeccompProfile)
+		assert.Equal(t, corev1.SeccompProfileTypeRuntimeDefault, merged.SeccompProfile.Type, "SeccompProfile always RuntimeDefault")
+		assert.Nil(t, userPodCtx.SeccompProfile, "original not mutated")
+	})
 }
