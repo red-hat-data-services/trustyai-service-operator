@@ -19,7 +19,7 @@ USER root
 RUN GO111MODULE=on CGO_ENABLED=1 GOOS=linux GOEXPERIMENT=strictfipsruntime \
     go build -tags 'strictfipsruntime netgo' -o /bin/driver ./cmd/lmes_driver/*.go
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:ae09ecc3d754bc1726cbda3e2599cc7839e09fe1cc547ce173cf669b645be3cc
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:8a842ac769de709143e4edeace516f2008dfdc431b64670ad3353fa323b44736
 
 COPY --from=builder /bin/driver /bin/driver
 
