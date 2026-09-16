@@ -1,0 +1,10 @@
+packages: []
+reinstallPackages:
+  - shadow-utils
+contentOrigin:
+  repofiles: ["redhat.repo"]
+arches:
+  - aarch64
+  - x86_64
+  - ppc64le
+  - s390x
