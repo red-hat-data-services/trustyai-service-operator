@@ -23,7 +23,8 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RPM_INPUT="trustyai-operator-module/.konflux/rpms.in.yaml"
 BASE_IMAGE="${RPM_LOCKFILE_BASE_IMAGE:-registry.access.redhat.com/ubi9:9.6}"
 RPM_LOCKFILE_VERSION="${RPM_LOCKFILE_VERSION:-0.20.0}"
-IMAGE="localhost/trustyai-rpm-lockfile:${RPM_LOCKFILE_VERSION}"
+RPM_LOCKFILE_CONTAINERFILE="${RPM_LOCKFILE_CONTAINERFILE:-trustyai-operator-module/Dockerfile}"
+IMAGE="localhost/trustyai-rpm-lockfile:${RPM_LOCKFILE_VERSION}-v2"
 
 usage() {
     cat <<EOF
@@ -38,6 +39,9 @@ Options:
 Environment:
   RPM_LOCKFILE_BASE_IMAGE  Base image for the generator (default: $BASE_IMAGE)
   RPM_LOCKFILE_VERSION     rpm-lockfile-prototype version (default: $RPM_LOCKFILE_VERSION)
+  RPM_LOCKFILE_CONTAINERFILE
+                          Containerfile whose base image supplies installed RPMs.
+                          Defaults to $RPM_LOCKFILE_CONTAINERFILE.
 EOF
 }
 
@@ -62,9 +66,12 @@ done
 
 cd "$PROJECT_ROOT"
 [[ -f "$RPM_INPUT" ]] || { echo "error: file not found: $RPM_INPUT" >&2; exit 1; }
+[[ -f "$RPM_LOCKFILE_CONTAINERFILE" ]] || {
+    echo "error: Containerfile not found: $RPM_LOCKFILE_CONTAINERFILE" >&2
+    exit 1
+}
 
 PREFETCH_DIR="$(dirname "$RPM_INPUT")"
-CONTAINER_PREFETCH_DIR="/workspace/$PREFETCH_DIR"
 
 if ! command -v podman >/dev/null 2>&1; then
     echo "error: podman is required" >&2
@@ -76,7 +83,7 @@ if ! podman image exists "$IMAGE" 2>/dev/null; then
     podman build --pull=missing -t "$IMAGE" -f - . <<EOF
 FROM $BASE_IMAGE
 USER root
-RUN dnf install -y python3 python3-pip python3-dnf rpm git && dnf clean all
+RUN dnf install -y python3 python3-pip python3-dnf rpm git skopeo && dnf clean all
 RUN python3 -m pip install --no-cache-dir \\
     --index-url https://pypi.org/simple/ \\
     https://github.com/konflux-ci/rpm-lockfile-prototype/archive/refs/tags/v${RPM_LOCKFILE_VERSION}.zip
@@ -85,12 +92,13 @@ fi
 
 echo "Generating lockfile from $RPM_INPUT"
 podman run --rm \
-    -v "$PROJECT_ROOT:/workspace" \
+    --user 0:0 \
+    -v "$PROJECT_ROOT:/workspace:Z" \
     -w /workspace \
     "$IMAGE" \
     bash -ceu '
         cd "$1"
-        rpm-lockfile-prototype rpms.in.yaml
-    ' bash "$PREFETCH_DIR"
+        rpm-lockfile-prototype --containerfile "/workspace/$2" rpms.in.yaml
+    ' bash "$PREFETCH_DIR" "$RPM_LOCKFILE_CONTAINERFILE"
 
 echo "Generated $PREFETCH_DIR/rpms.lock.yaml"
