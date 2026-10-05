@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi9/go-toolset:1.26.5@sha256:f99dd81b20e5971ef9f63a51ac27cf0aa591ff9921d021490548b67fd9b17144 AS builder
+FROM registry.redhat.io/ubi9/go-toolset:1.26@sha256:d45bb2ba2e518d3edf14ad3baf6c57fdc7cc44c996cad1200f71036f7c1c8d29 AS builder
 
 WORKDIR /go/src/github.com/trustyai-explainability/trustyai-service-operator
 # Copy the Go Modules manifests
@@ -19,7 +19,7 @@ USER root
 RUN GO111MODULE=on CGO_ENABLED=1 GOOS=linux GOEXPERIMENT=strictfipsruntime \
     go build -tags 'strictfipsruntime netgo' -o /bin/driver ./cmd/lmes_driver/*.go
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+FROM registry.redhat.io/ubi9-minimal:latest@sha256:1d7c5517a4a1a8e2688620b39ee980e82505ca1ab7ae5541b5463120ae9b3897
 
 COPY --from=builder /bin/driver /bin/driver
 
