@@ -1,5 +1,5 @@
 # Build the trustyai-operator-module-controller binary
-FROM registry.redhat.io/ubi9/go-toolset:1.26@sha256:d36470d5258da00f618b7aca9bdaab8e05134aa938bd6c42d9bd17d50ed45e76 AS builder
+FROM registry.redhat.io/ubi9/go-toolset:1.26@sha256:60fd6fb2998c40ad0d6561c34e83588b986a0cf7771f64e5e5c295ba87101f9b AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -29,7 +29,7 @@ COPY hack/get_trustyai_manifests.sh hack/
 RUN bash hack/get_trustyai_manifests.sh
 
 # Runtime image
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:8a842ac769de709143e4edeace516f2008dfdc431b64670ad3353fa323b44736
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:b3a0b012de0c578082e1bc5b01c8bc27461b4eeb571a0b1a2b21a07dbd845a62
 ARG CI_CONTAINER_VERSION=latest
 
 WORKDIR /
