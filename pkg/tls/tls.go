@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +36,28 @@ import (
 
 var log = ctrl.Log.WithName("tls")
 
+// implementedCipherSuites returns the IDs of every cipher suite implemented
+// by the running Go build, excluding RC4 suites prohibited by RFC 7465.
+func implementedCipherSuites() map[uint16]struct{} {
+	implemented := make(map[uint16]struct{})
+	for _, suite := range tls.CipherSuites() {
+		implemented[suite.ID] = struct{}{}
+	}
+	for _, suite := range tls.InsecureCipherSuites() {
+		if !strings.Contains(suite.Name, "RC4") {
+			implemented[suite.ID] = struct{}{}
+		}
+	}
+	return implemented
+}
+
+func normalizeTLSProfileSpec(spec configv1.TLSProfileSpec) configv1.TLSProfileSpec {
+	if spec.MinTLSVersion == "" {
+		spec.MinTLSVersion = configv1.VersionTLS12
+	}
+	return spec
+}
+
 // Result holds the resolved TLS configuration.
 type Result struct {
 	TLSOpts      []func(*tls.Config)
@@ -48,10 +71,22 @@ var proxyArgsState = struct {
 	sync.RWMutex
 	args ProxyTLSArguments
 }{
-	args: ProxyTLSArguments{MinVersion: string(configv1.VersionTLS12), Args: []string{
-		"--tls-min-version=" + string(configv1.VersionTLS12),
-		"--tls-curve-preferences=23,24,25,29",
-	}},
+	// Seeded from ResolveProxyTLSArguments so curve IDs stay aligned with
+	// defaultCurveGroups. init() re-resolves with the host FIPS setting.
+	//
+	// 4588 (X25519MLKEM768) requires a kube-rbac-proxy that accepts
+	// --tls-curve-preferences and CurveID 4588; unknown IDs fail startup
+	// (CrashLoopBackOff). Override the kube-rbac-proxy ConfigMap image
+	// only with a build that supports both.
+	args: mustDefaultProxyTLSArguments(false),
+}
+
+func mustDefaultProxyTLSArguments(fips bool) ProxyTLSArguments {
+	args, err := ResolveProxyTLSArguments(nil, TLSAdherenceNoOpinion, nil, fips)
+	if err != nil {
+		panic(fmt.Sprintf("default proxy TLS arguments: %v", err))
+	}
+	return args
 }
 
 // SetProxyTLSArguments publishes the arguments used by workload builders.
@@ -84,10 +119,9 @@ func init() {
 }
 
 // Resolve reads the cluster TLS profile from apiservers.config.openshift.io/cluster
-// and returns TLS option functions for controller-runtime.
-// On non-OpenShift clusters or when the profile cannot be read, it returns
-// hardened Intermediate defaults. Returns an error only on unexpected failures
-// that should prevent startup (fail-closed).
+// and returns TLS option functions for controller-runtime. On non-OpenShift
+// clusters or transient API errors, it returns hardened Intermediate defaults.
+// Authorization and unexpected failures return errors to prevent startup.
 func Resolve(ctx context.Context, cfg *rest.Config) (Result, error) {
 	var result Result
 
@@ -116,12 +150,14 @@ func Resolve(ctx context.Context, cfg *rest.Config) (Result, error) {
 			log.Info("Transient API error reading TLS profile, using hardened defaults", "error", err)
 			result.APIAvailable = true
 		case apierrors.IsForbidden(err), apierrors.IsUnauthorized(err):
-			log.Info("Permission denied reading TLS profile, using hardened defaults; watcher will retry", "error", err)
-			result.APIAvailable = true
+			return result, fmt.Errorf("permission denied reading APIServer TLS profile: %w", err)
 		default:
 			return result, fmt.Errorf("failed to read APIServer TLS profile: %w", err)
 		}
-		result.TLSOpts, _ = tlsOptsForProfile(nil)
+		result.TLSOpts, err = tlsOptsForProfile(nil, TLSAdherenceNoOpinion)
+		if err != nil {
+			return result, err
+		}
 		if result.APIAvailable {
 			// A transient read failure must not replace a previously published
 			// strict profile with NoOpinion arguments. Keep the last known-good
@@ -137,7 +173,7 @@ func Resolve(ctx context.Context, cfg *rest.Config) (Result, error) {
 	result.ProfileSpec = state.profile
 	result.TLSAdherence = state.adherence
 
-	result.TLSOpts, err = tlsOptsForProfile(state.profile)
+	result.TLSOpts, err = tlsOptsForProfile(state.profile, state.adherence)
 	if err != nil {
 		return result, err
 	}
@@ -155,15 +191,47 @@ func Resolve(ctx context.Context, cfg *rest.Config) (Result, error) {
 	return result, nil
 }
 
-func tlsOptsForProfile(profile *configv1.TLSSecurityProfile) ([]func(*tls.Config), error) {
+func tlsOptsForProfile(profile *configv1.TLSSecurityProfile, adherence string) ([]func(*tls.Config), error) {
 	profileSpec, err := openshifttls.GetTLSProfileSpec(profile)
 	if err != nil {
 		return nil, fmt.Errorf("resolving OpenShift TLS profile: %w", err)
+	}
+	profileSpec = normalizeTLSProfileSpec(profileSpec)
+	if _, err := tlsVersion(string(profileSpec.MinTLSVersion)); err != nil {
+		return nil, fmt.Errorf("unsupported minimum TLS version %q: %w", profileSpec.MinTLSVersion, err)
 	}
 
 	tlsConfig, unsupported := openshifttls.NewTLSConfigFromProfile(profileSpec)
 	if len(unsupported) > 0 {
 		log.Info("TLS profile contains settings unsupported by Go", "unsupported", unsupported)
+	}
+	if profileSpec.MinTLSVersion != configv1.VersionTLS13 {
+		strict := adherence != TLSAdherenceNoOpinion && adherence != TLSAdherenceLegacyAdheringComponentsOnly
+		if len(profileSpec.Ciphers) == 0 && strict {
+			return nil, fmt.Errorf("TLS profile has no cipher suites for TLS <= 1.2")
+		}
+		if len(profileSpec.Ciphers) > 0 {
+			goConfig := &tls.Config{}
+			tlsConfig(goConfig)
+			implementedCiphers := implementedCipherSuites()
+			usableCiphers := make([]uint16, 0, len(goConfig.CipherSuites))
+			for _, suite := range goConfig.CipherSuites {
+				if suite >= 0x1300 && suite <= 0x13ff {
+					continue
+				}
+				if _, ok := implementedCiphers[suite]; ok {
+					usableCiphers = append(usableCiphers, suite)
+				}
+			}
+			if len(usableCiphers) == 0 {
+				return nil, fmt.Errorf("failed to find usable cipher suites for TLS <= 1.2: all %d ciphers in TLS profile are TLS 1.3-only, unimplemented by Go, or excluded by policy", len(profileSpec.Ciphers))
+			}
+			profileTLSConfig := tlsConfig
+			tlsConfig = func(c *tls.Config) {
+				profileTLSConfig(c)
+				c.CipherSuites = usableCiphers
+			}
+		}
 	}
 
 	return []func(*tls.Config){tlsConfig, setALPN}, nil
