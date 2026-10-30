@@ -31,7 +31,7 @@ RUN CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} GOEXPERIMENT=stri
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 
-FROM registry.redhat.io/ubi9/ubi-minimal:latest@sha256:660adca8516eaf4d033616118fe87c5df60af51e6346c528f3aaa225b1a5cc6d
+FROM registry.redhat.io/ubi9/ubi-minimal:latest@sha256:bba2b4bbf0ed15cfe7dd72a1e17ae7d2015a141f306b304e1a2785c41400e39c
 
 WORKDIR /
 COPY --from=builder /workspace/manager .
