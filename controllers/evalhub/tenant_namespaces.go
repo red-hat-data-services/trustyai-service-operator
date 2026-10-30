@@ -105,6 +105,24 @@ func (r *EvalHubReconciler) reconcileTenantNamespaces(ctx context.Context, insta
 			return err
 		}
 
+		// The namespace is the tenant trust boundary: grant its ServiceAccounts
+		// EvalHub user access through a namespace-local Role. Authorization checks
+		// use the X-Tenant namespace, not the control-plane namespace.
+		tenantUserRoleName, err := r.ensureTenantUserRole(ctx, instance, ns)
+		if err != nil {
+			log.Error(err, "Failed to create tenant user Role in tenant namespace", "namespace", ns)
+			return err
+		}
+		tenantUserRBName := normalizeDNS1123LabelValue(instance.Name + "-" + ns + "-tenant-user-rb")
+		if err := r.createTenantGroupRoleBinding(ctx, instance, tenantUserRBName, ns, rbacv1.RoleRef{
+			Kind:     "Role",
+			Name:     tenantUserRoleName,
+			APIGroup: rbacv1.GroupName,
+		}); err != nil {
+			log.Error(err, "Failed to create tenant user RoleBinding in tenant namespace", "namespace", ns)
+			return err
+		}
+
 		// Create pod-logs Role and RoleBinding so the EvalHub service SA can read job pod logs.
 		if err := r.createServicePodLogsRole(ctx, instance, ns); err != nil {
 			log.Error(err, "Failed to create service pod-logs Role in tenant namespace", "namespace", ns)
