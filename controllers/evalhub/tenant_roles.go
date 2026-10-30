@@ -5,6 +5,7 @@ import (
 
 	evalhubv1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -59,6 +60,69 @@ func (r *EvalHubReconciler) ensureRole(ctx context.Context, instance *evalhubv1.
 	}
 	existing.Rules = rules
 	return r.Update(ctx, existing)
+}
+
+// tenantUserRoleNameForInstance returns the name of the Role that grants a tenant
+// namespace's own ServiceAccounts access to this EvalHub instance.
+//
+// The instance name alone is not unique: multi-tenancy is driven by namespace
+// labels, so two EvalHub CRs with the same name in different namespaces
+// reconcile the same tenant namespace. A Role named "<name>-user" would then be
+// shared by both - the second reconciler finds the first one's Role, leaves its
+// labels pointing at the other instance, and cleanupStaleTenantResources can
+// later delete a Role the other instance still needs. Scope the name with the
+// instance namespace, as the per-tenant job resources already are.
+func tenantUserRoleNameForInstance(instance *evalhubv1.EvalHub) string {
+	return normalizeDNS1123LabelValue(jobResourceInstanceID(instance) + "-user")
+}
+
+// tenantUserRoleBindingName returns the RoleBinding name for a tenant namespace.
+// The tenant namespace alone does not identify the grant either: same-named
+// instances must not share a binding, since its labels decide which instance
+// cleans it up.
+func tenantUserRoleBindingName(instance *evalhubv1.EvalHub, namespace string) string {
+	return normalizeDNS1123LabelValue(jobResourceInstanceID(instance) + "-" + namespace + "-tenant-user-rb")
+}
+
+// ensureTenantUserRole creates or updates the tenant user Role in a tenant
+// namespace and returns its name. Unlike ensureRole it targets an arbitrary
+// namespace and labels the Role - rather than setting an owner reference, which
+// cannot cross namespaces - so cleanupStaleTenantResources collects it when the
+// namespace stops being a tenant.
+func (r *EvalHubReconciler) ensureTenantUserRole(ctx context.Context, instance *evalhubv1.EvalHub, namespace string) (string, error) {
+	log := log.FromContext(ctx)
+	name := tenantUserRoleNameForInstance(instance)
+
+	desired := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    jobResourceLabels(instance, name),
+		},
+		Rules: tenantUserRules(instance),
+	}
+
+	existing := &rbacv1.Role{}
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, existing)
+	if errors.IsNotFound(err) {
+		log.Info("Creating tenant user Role in tenant namespace", "namespace", namespace, "name", name)
+		if err := r.Create(ctx, desired); err != nil {
+			return "", err
+		}
+		return name, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if equality.Semantic.DeepEqual(existing.Rules, desired.Rules) {
+		return name, nil
+	}
+	existing.Rules = desired.Rules
+	log.Info("Updating tenant user Role in tenant namespace", "namespace", namespace, "name", name)
+	if err := r.Update(ctx, existing); err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 // ensureTenantAdminBinding creates or updates a RoleBinding that binds the evalhub-tenant-admin
@@ -175,6 +239,12 @@ func tenantUserRules(instance *evalhubv1.EvalHub) []rbacv1.PolicyRule {
 			APIGroups: []string{"trustyai.opendatahub.io"},
 			Resources: []string{"collections", "providers"},
 			Verbs:     []string{"get", "list", "watch"},
+		},
+		{
+			// Job sidecars post lifecycle status back through this virtual resource.
+			APIGroups: []string{"trustyai.opendatahub.io"},
+			Resources: []string{"status-events"},
+			Verbs:     []string{"create"},
 		},
 		{
 			APIGroups:     []string{"trustyai.opendatahub.io"},

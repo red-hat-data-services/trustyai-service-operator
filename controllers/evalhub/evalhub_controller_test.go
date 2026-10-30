@@ -244,6 +244,42 @@ var _ = Describe("EvalHub Lifecycle Integration", func() {
 		namespace = nil
 	})
 
+	It("should include Coding in default collections and mount its ConfigMap", func() {
+		By("Checking that CRD defaulting selects Coding when collections are omitted")
+		Expect(evalHub.Spec.Collections).To(ContainElement("coding-v1"))
+		Expect(evalHub.Spec.Collections).NotTo(ContainElement("open-telco-v1"))
+
+		By("Reconciling status, finalizer, and resources")
+		for range 3 {
+			_, err := performReconcile(reconciler, evalHubName, testNamespace)
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		By("Checking that the Coding collection ConfigMap is copied and owned by the EvalHub")
+		collectionCMName := evalHubName + "-collection-coding-v1"
+		collectionCM := waitForConfigMap(collectionCMName, testNamespace)
+		Expect(collectionCM.Data).To(HaveKeyWithValue("coding-v1.yaml", "id: coding-v1\nname: coding-v1\n"))
+		Expect(collectionCM.OwnerReferences).To(HaveLen(1))
+		Expect(collectionCM.OwnerReferences[0].UID).To(Equal(evalHub.UID))
+
+		By("Checking that the collection is projected into the EvalHub deployment")
+		deployment := waitForDeployment(evalHubName, testNamespace)
+		Expect(deployment.Spec.Template.Spec.Volumes).To(ContainElement(And(
+			HaveField("Name", collectionsVolumeName),
+			HaveField("Projected.Sources", ContainElement(corev1.VolumeProjection{
+				ConfigMap: &corev1.ConfigMapProjection{
+					LocalObjectReference: corev1.LocalObjectReference{Name: collectionCMName},
+				},
+			})),
+		)))
+		Expect(deployment.Spec.Template.Spec.Containers).To(ContainElement(And(
+			HaveField("Name", "evalhub"),
+			HaveField("VolumeMounts", ContainElement(corev1.VolumeMount{
+				Name: collectionsVolumeName, MountPath: collectionsMountPath, ReadOnly: true,
+			})),
+		)))
+	})
+
 	It("should create all required resources through complete reconciliation", func() {
 		By("Performing initial reconciliation to set status")
 		result, err := performReconcile(reconciler, evalHubName, testNamespace)
@@ -262,7 +298,7 @@ var _ = Describe("EvalHub Lifecycle Integration", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Checking that ConfigMap is created")
-		configMapCreated := waitForConfigMap(evalHubName+"-config", testNamespace)
+		configMapCreated := waitForConfigMap(evalHubConfigMapName(evalHub), testNamespace)
 		Expect(configMapCreated.Data).To(HaveKey("config.yaml"))
 
 		By("Checking that the NetworkPolicy precedes Deployment creation")

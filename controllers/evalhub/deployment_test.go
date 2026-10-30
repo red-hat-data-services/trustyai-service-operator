@@ -1,6 +1,7 @@
 package evalhub
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"time"
@@ -104,6 +105,10 @@ var _ = Describe("EvalHub Deployment", func() {
 			Expect(labels["app"]).To(Equal("eval-hub"))
 			Expect(labels["instance"]).To(Equal(evalHubName))
 			Expect(labels["component"]).To(Equal("api"))
+
+			By("checking the proxy authorization config hash is attached to the pod template")
+			expectedAuthConfigHash := fmt.Sprintf("%x", sha256.Sum256([]byte(generateAuthConfigData())))
+			Expect(deployment.Spec.Template.Annotations[evalHubAuthConfigHashAnnotation]).To(Equal(expectedAuthConfigHash))
 		})
 
 		It("should configure evalhub container correctly", func() {
@@ -186,8 +191,8 @@ var _ = Describe("EvalHub Deployment", func() {
 			// EvalHub listens HTTP on loopback; kube-rbac-proxy terminates TLS on servicePort
 			Expect(envVars["API_HOST"]).To(Equal("127.0.0.1"))
 			Expect(envVars["PORT"]).To(Equal(fmt.Sprintf("%d", evalHubAppPort)))
-			Expect(envVars).NotTo(HaveKey("TLS_CERT_FILE"))
-			Expect(envVars).NotTo(HaveKey("TLS_KEY_FILE"))
+			Expect(envVars).To(HaveKeyWithValue("TLS_CERT_FILE", ""))
+			Expect(envVars).To(HaveKeyWithValue("TLS_KEY_FILE", ""))
 			Expect(envVars["LOG_LEVEL"]).To(Equal("INFO"))
 			Expect(envVars["MAX_CONCURRENT_EVALUATIONS"]).To(Equal("10"))
 			Expect(envVars["DEFAULT_TIMEOUT_MINUTES"]).To(Equal("60"))
@@ -510,7 +515,7 @@ var _ = Describe("EvalHub Deployment", func() {
 			By("Checking evalhub config volume")
 			Expect(evalHubConfigVolume).NotTo(BeNil())
 			Expect(evalHubConfigVolume.VolumeSource.ConfigMap).NotTo(BeNil())
-			Expect(evalHubConfigVolume.VolumeSource.ConfigMap.Name).To(Equal(evalHubName + "-config"))
+			Expect(evalHubConfigVolume.VolumeSource.ConfigMap.Name).To(Equal(evalHubConfigMapName(evalHub)))
 
 			By("Checking TLS volume")
 			Expect(tlsVolume).NotTo(BeNil())

@@ -18,10 +18,14 @@ package tls
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"testing"
 
 	configv1 "github.com/openshift/api/config/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -52,6 +56,13 @@ func mustReconcile(t *testing.T, w *ProfileWatcher) reconcile.Result {
 	return result
 }
 
+func TestProfileWatcherRunsOnEveryReplica(t *testing.T) {
+	w := NewProfileWatcherWithAdherence(nil, nil, TLSAdherenceNoOpinion, nil)
+	if w.NeedLeaderElection() {
+		t.Fatal("every replica must observe TLS policy changes, including non-leaders")
+	}
+}
+
 func TestReconcile_ProfileUnchanged(t *testing.T) {
 	profile := &configv1.TLSSecurityProfile{Type: configv1.TLSProfileIntermediateType}
 	scheme := newTestScheme(t)
@@ -69,6 +80,32 @@ func TestReconcile_ProfileUnchanged(t *testing.T) {
 	}
 	if called {
 		t.Error("onProfileChange must not be called when profile is unchanged")
+	}
+}
+
+func TestReconcile_DeniedReadRestartsToFailClosed(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "forbidden", err: apierrors.NewForbidden(schema.GroupResource{Resource: "apiservers"}, "cluster", errors.New("denied"))},
+		{name: "unauthorized", err: apierrors.NewUnauthorized("denied")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			w := NewProfileWatcher(nil, nil, func() { called = true })
+			w.readProfileState = func(context.Context) (profileState, error) {
+				return profileState{}, tt.err
+			}
+
+			result := mustReconcile(t, w)
+			if result.RequeueAfter != 0 {
+				t.Errorf("RequeueAfter = %v, want no retry after denied read", result.RequeueAfter)
+			}
+			if !called {
+				t.Error("restart callback was not called after denied read")
+			}
+		})
 	}
 }
 
@@ -125,7 +162,7 @@ func TestReconcile_APIServerNotFound(t *testing.T) {
 }
 
 func TestReconcile_InitialNilToProfile(t *testing.T) {
-	profile := &configv1.TLSSecurityProfile{Type: configv1.TLSProfileIntermediateType}
+	profile := &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType}
 	scheme := newTestScheme(t)
 
 	apiServer := newAPIServerWithProfile(profile)
@@ -142,7 +179,7 @@ func TestReconcile_InitialNilToProfile(t *testing.T) {
 }
 
 func TestReconcile_ProfileNilledOut(t *testing.T) {
-	initial := &configv1.TLSSecurityProfile{Type: configv1.TLSProfileIntermediateType}
+	initial := &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType}
 	scheme := newTestScheme(t)
 
 	apiServer := newAPIServerWithProfile(nil)
@@ -212,6 +249,48 @@ func TestReconcile_AdherenceChange(t *testing.T) {
 	}
 	if w.lastAdherence != TLSAdherenceStrictAllComponents {
 		t.Errorf("watcher did not retain the new adherence: %q", w.lastAdherence)
+	}
+}
+
+func TestReconcile_TransientFailurePreservesPolicyUntilRecovery(t *testing.T) {
+	initial := &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType}
+	previous := CurrentProxyTLSArguments()
+	args, err := ResolveProxyTLSArguments(initial, TLSAdherenceStrictAllComponents, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	SetProxyTLSArguments(args)
+	defer SetProxyTLSArguments(previous)
+
+	restarts := 0
+	w := NewProfileWatcherWithAdherence(nil, initial, TLSAdherenceStrictAllComponents, func() { restarts++ })
+	w.readProfileState = func(context.Context) (profileState, error) {
+		return profileState{}, apierrors.NewServiceUnavailable("temporary outage")
+	}
+	result := mustReconcile(t, w)
+	if result.RequeueAfter != profileRetryInterval || restarts != 0 ||
+		!reflect.DeepEqual(w.lastProfile, initial) || w.lastAdherence != TLSAdherenceStrictAllComponents ||
+		!reflect.DeepEqual(CurrentProxyTLSArguments(), args) {
+		t.Fatal("transient runtime failure changed the last-known-good policy or triggered restart")
+	}
+
+	// Recovery with the same policy must not restart; a subsequent adherence-only
+	// change must restart so bootstrap can resolve the new complete policy.
+	w.readProfileState = func(context.Context) (profileState, error) {
+		return profileState{profile: initial, adherence: TLSAdherenceStrictAllComponents}, nil
+	}
+	if result := mustReconcile(t, w); result.RequeueAfter != 0 || restarts != 0 {
+		t.Fatal("recovery with unchanged policy should not restart or requeue")
+	}
+	w.readProfileState = func(context.Context) (profileState, error) {
+		return profileState{profile: initial, adherence: TLSAdherenceLegacyAdheringComponentsOnly}, nil
+	}
+	mustReconcile(t, w)
+	if restarts != 1 {
+		t.Fatal("adherence change after recovery must restart")
+	}
+	if !reflect.DeepEqual(CurrentProxyTLSArguments(), args) {
+		t.Fatal("watcher must leave publishing to the next successful bootstrap")
 	}
 }
 

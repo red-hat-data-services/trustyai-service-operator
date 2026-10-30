@@ -3,6 +3,7 @@ package evalhub
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"sort"
@@ -30,8 +31,8 @@ type ServiceConfig struct {
 	DisableAuth     bool   `json:"disable_auth,omitempty"`
 	TerminationFile string `json:"termination_file"`
 	EvalInitImage   string `json:"eval_init_image,omitempty"`
-	TLSCertFile     string `json:"tls_cert_file,omitempty"`
-	TLSKeyFile      string `json:"tls_key_file,omitempty"`
+	TLSCertFile     string `json:"tls_cert_file"`
+	TLSKeyFile      string `json:"tls_key_file"`
 }
 
 // DatabaseConfig represents the database configuration in config.yaml
@@ -115,6 +116,19 @@ type EvalHubConfig struct {
 	Sidecar     *SidecarConfig  `json:"sidecar,omitempty"`
 }
 
+// evalHubConfigMapName returns a ConfigMap name tied to the instance and the
+// authorization policy. A new policy therefore gets a new ConfigMap reference,
+// so a pod always mounts the auth.yaml matching its pod-template hash.
+func evalHubConfigMapName(instance *evalhubv1.EvalHub) string {
+	digest := sha256.Sum256([]byte(instance.Namespace + "\x00" + instance.Name + "\x00" + generateAuthConfigData()))
+	suffix := fmt.Sprintf("-config-%x", digest[:8])
+	name := instance.Name
+	if maxNameLength := 253 - len(suffix); len(name) > maxNameLength {
+		name = strings.TrimRight(name[:maxNameLength], ".-")
+	}
+	return name + suffix
+}
+
 // reconcileConfigMap creates or updates the ConfigMap for EvalHub configuration
 func (r *EvalHubReconciler) reconcileConfigMap(ctx context.Context, instance *evalhubv1.EvalHub) error {
 	log := log.FromContext(ctx)
@@ -122,7 +136,7 @@ func (r *EvalHubReconciler) reconcileConfigMap(ctx context.Context, instance *ev
 
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.Name + "-config",
+			Name:      evalHubConfigMapName(instance),
 			Namespace: instance.Namespace,
 		},
 	}
@@ -167,6 +181,7 @@ func (r *EvalHubReconciler) generateConfigData(ctx context.Context, instance *ev
 	config := EvalHubConfig{
 		Service: ServiceConfig{
 			Port:            evalHubAppPort,
+			Host:            "127.0.0.1",
 			DisableAuth:     true,
 			TerminationFile: "/tmp/termination-log",
 			EvalInitImage:   evalHubImage,
@@ -175,8 +190,6 @@ func (r *EvalHubReconciler) generateConfigData(ctx context.Context, instance *ev
 			"PORT":                        "service.port",
 			"API_HOST":                    "service.host",
 			"DISABLE_AUTH":                "service.disable_auth",
-			"TLS_CERT_FILE":               "service.tls_cert_file",
-			"TLS_KEY_FILE":                "service.tls_key_file",
 			"DB_URL":                      "database.url",
 			"MLFLOW_TRACKING_URI":         "mlflow.tracking_uri",
 			"MLFLOW_CA_CERT_PATH":         "mlflow.ca_cert_path",
@@ -399,6 +412,26 @@ func generateAuthConfigData() string {
                 namespace: "{{.FromHeader}}"
                 apiGroup: mlflow.kubeflow.org
                 resource: experiments
+                verb: get
+    - path: /api/v1/evaluations/collections/*/clones
+      mappings:
+        - methods: [post]
+          resources:
+            - rewrites:
+                byHttpHeader:
+                  name: X-Tenant
+              resourceAttributes:
+                namespace: "{{.FromHeader}}"
+                apiGroup: trustyai.opendatahub.io
+                resource: collections
+                verb: create
+            - rewrites:
+                byHttpHeader:
+                  name: X-Tenant
+              resourceAttributes:
+                namespace: "{{.FromHeader}}"
+                apiGroup: trustyai.opendatahub.io
+                resource: collections
                 verb: get
     - path: /api/v1/evaluations/collections/*
       mappings:

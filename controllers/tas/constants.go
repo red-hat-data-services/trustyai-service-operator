@@ -42,9 +42,10 @@ const (
 // Status types
 const (
 	// Standard condition types (platform contract)
-	ConditionTypeReady                 = "Ready"
-	ConditionTypeDegraded              = "Degraded"
-	ConditionTypeProvisioningSucceeded = "ProvisioningSucceeded"
+	ConditionTypeReady                   = "Ready"
+	ConditionTypeDegraded                = "Degraded"
+	ConditionTypeProvisioningSucceeded   = "ProvisioningSucceeded"
+	ConditionTypeDatabaseTuningAvailable = "DatabaseTuningAvailable"
 
 	// TrustyAI-specific condition types
 	StatusTypeInferenceServicesPresent = "InferenceServicesPresent"
@@ -67,6 +68,7 @@ const (
 	StatusDBCredentialsNotFound           = "DBCredentialsNotFound"
 	StatusDBCredentialsError              = "DBCredentialsError"
 	StatusDBConnectionError               = "DBConnectionError"
+	StatusInvalidMigrationConfiguration   = "InvalidMigrationConfiguration"
 	StatusDBAvailable                     = "DBAvailable"
 )
 
@@ -95,4 +97,8 @@ const (
 	PhaseNotReady = "Not Ready"
 )
 
-const migrationAnnotationKey = "trustyai.opendatahub.io/db-migration"
+const (
+	migrationAnnotationKey = "trustyai.opendatahub.io/db-migration"
+	// migrationEnvVarName enables the service's automatic PVC to database migration.
+	migrationEnvVarName = "DATABASE_ATTEMPT_MIGRATION"
+)
