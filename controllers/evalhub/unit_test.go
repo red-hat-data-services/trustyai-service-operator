@@ -2548,6 +2548,32 @@ func TestEvalHubReconciler_reconcileTenantNamespaces(t *testing.T) {
 		assert.Equal(t, instanceNamespace, rb.Subjects[0].Namespace)
 	})
 
+	t.Run("should grant tenant ServiceAccounts namespace-local user access", func(t *testing.T) {
+		tenantNS := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+			Name: tenantNamespace, Labels: map[string]string{tenantLabel: ""},
+		}}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(evalHub, tenantNS).Build()
+		reconciler := &EvalHubReconciler{Client: fakeClient, Scheme: scheme, EventRecorder: record.NewFakeRecorder(10)}
+		// Reconciliation must be idempotent.
+		for i := 0; i < 2; i++ {
+			require.NoError(t, reconciler.reconcileTenantNamespaces(ctx, evalHub))
+		}
+		roleName := normalizeDNS1123LabelValue(evalHubName + "-user")
+		role := &rbacv1.Role{}
+		require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: roleName, Namespace: tenantNamespace}, role))
+		assert.Equal(t, tenantUserRules(evalHub), role.Rules)
+		assert.Equal(t, jobResourceInstanceID(evalHub), role.Labels["eval-hub.trustyai.opendatahub.io"])
+		assert.Equal(t, "job", role.Labels["app.kubernetes.io/component"])
+
+		rbName := normalizeDNS1123LabelValue(evalHubName + "-" + tenantNamespace + "-tenant-user-rb")
+		rb := &rbacv1.RoleBinding{}
+		require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: rbName, Namespace: tenantNamespace}, rb))
+		assert.Equal(t, rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: roleName}, rb.RoleRef)
+		assert.Equal(t, []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: "Group", Name: "system:serviceaccounts:" + tenantNamespace}}, rb.Subjects)
+		assert.Equal(t, jobResourceInstanceID(evalHub), rb.Labels["eval-hub.trustyai.opendatahub.io"])
+		assert.Equal(t, "job", rb.Labels["app.kubernetes.io/component"])
+	})
+
 	t.Run("should create service pod-logs Role and RoleBinding in tenant namespace", func(t *testing.T) {
 		tenantNS := &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
