@@ -12,6 +12,9 @@ metadata:
     app.kubernetes.io/part-of: trustyai
     app.kubernetes.io/version: {{ .Version }}
 spec:
+  {{ if .Instance.IsMigration }}
+  progressDeadlineSeconds: 2100
+  {{ end }}
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -43,6 +46,19 @@ spec:
         - name: trustyai-service
           image: {{ .ServiceImage }}
           env:
+            # The sidecars own TLS; never mount serving keys in the Python app.
+            - name: TLS_POLICY
+              value: system
+            - name: TLS_REQUIRED
+              value: "false"
+            - name: TLS_CERT_FILE
+              value: /var/run/trustyai/no-native-tls/tls.crt
+            - name: TLS_KEY_FILE
+              value: /var/run/trustyai/no-native-tls/tls.key
+            - name: HTTP_PORT
+              value: "8081"
+            - name: HEALTH_PORT
+              value: "8080"
             - name: SERVICE_STORAGE_FORMAT
               value: {{ .Instance.Spec.Storage.Format }}
             {{ if eq .Instance.Spec.Storage.Format "PVC" }}
@@ -62,6 +78,8 @@ spec:
               value: {{ .Instance.Spec.Storage.Folder }}
             - name: SERVICE_DATA_FORMAT
               value: {{ .Instance.Spec.Data.Format }}
+            - name: {{ .MigrationEnvVarName }}
+              value: "true"
             {{ end }}
             {{ if eq .Instance.Spec.Storage.Format "DATABASE" }}
             - name: QUARKUS_HIBERNATE_ORM_ACTIVE
@@ -122,6 +140,16 @@ spec:
             - name: STORAGE_MIGRATION_CONFIG_FROM_FILENAME
               value: {{ .Instance.Spec.Data.Filename }}
             {{ end }}
+          {{ if .Instance.IsMigration }}
+          # Allow up to 30 minutes for migration before liveness takes over.
+          startupProbe:
+            httpGet:
+              path: /q/health/live
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 180
+          {{ end }}
           readinessProbe:
             httpGet:
               path: /q/health/ready
@@ -137,9 +165,6 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 2
           volumeMounts:
-            - name: {{ .Instance.Name }}-internal
-              readOnly: false
-              mountPath: /etc/tls/internal
             {{ if or (eq .Instance.Spec.Storage.Format "PVC") (.Instance.IsMigration) }}
             - name: {{ .VolumeMountName }}
               mountPath: {{ .Instance.Spec.Storage.Folder }}
@@ -210,6 +235,58 @@ spec:
               mountPath: /etc/ssl/certs/ca-bundle.crt
               subPath: ca-bundle.crt
             {{ end }}
+        # Internal KServe HTTPS preserves the unauthenticated consumer contract,
+        # not access to the main API. All other paths retain proxy authorization.
+        - name: internal-tls-proxy
+          image: {{ .KubeRBACProxyImage }}
+          args:
+            - --secure-listen-address=0.0.0.0:4443
+            - --upstream=http://127.0.0.1:8080/
+            - --config-file=/etc/kube-rbac-proxy/config.yaml
+            - --ignore-paths=/,/consumer/kserve/v2,/q/health/live,/q/health/ready
+{{- range .ProxyTLSArgs }}
+            - {{ . }}
+{{- end }}
+            - --tls-cert-file=/etc/tls/private/tls.crt
+            - --tls-private-key-file=/etc/tls/private/tls.key
+            - --v=0
+          ports:
+            - containerPort: 4443
+              name: internal-https
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /q/health/ready
+              port: 4443
+              scheme: HTTPS
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /q/health/live
+              port: 4443
+              scheme: HTTPS
+            initialDelaySeconds: 30
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
+            requests:
+              cpu: 50m
+              memory: 32Mi
+          volumeMounts:
+            - name: {{ .Instance.Name }}-internal
+              mountPath: /etc/tls/private
+              readOnly: true
+            - name: kube-rbac-proxy-config
+              mountPath: /etc/kube-rbac-proxy
+              readOnly: true
       serviceAccount: {{ .Instance.Name }}-proxy
       volumes:
         {{ if or (eq .Instance.Spec.Storage.Format "PVC") ( .Instance.IsMigration) }}

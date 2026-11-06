@@ -23,6 +23,8 @@ import (
 	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
+	openshifttls "github.com/openshift/controller-runtime-common/pkg/tls"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/dynamic"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -42,16 +44,17 @@ type ProfileWatcher struct {
 	lastProfile      *configv1.TLSSecurityProfile
 	lastAdherence    string
 	readProfileState func(context.Context) (profileState, error)
-	onProfileChange  func()
+	onRestart        func()
 }
 
-func NewProfileWatcher(c client.Client, initialProfile *configv1.TLSSecurityProfile, onProfileChange func()) *ProfileWatcher {
-	return NewProfileWatcherWithAdherence(c, initialProfile, TLSAdherenceNoOpinion, onProfileChange)
+func NewProfileWatcher(c client.Client, initialProfile *configv1.TLSSecurityProfile, onRestart func()) *ProfileWatcher {
+	return NewProfileWatcherWithAdherence(c, initialProfile, TLSAdherenceNoOpinion, onRestart)
 }
 
 // NewProfileWatcherWithAdherence seeds the watcher with the profile and
-// adherence state read from the APIServer during operator bootstrap.
-func NewProfileWatcherWithAdherence(c client.Client, initialProfile *configv1.TLSSecurityProfile, initialAdherence string, onProfileChange func()) *ProfileWatcher {
+// adherence baseline from bootstrap, including Intermediate/NoOpinion after a
+// transient read failure. The production reader is installed by SetupWithManager.
+func NewProfileWatcherWithAdherence(c client.Client, initialProfile *configv1.TLSSecurityProfile, initialAdherence string, onRestart func()) *ProfileWatcher {
 	return &ProfileWatcher{
 		Client:        c,
 		lastProfile:   initialProfile,
@@ -63,22 +66,35 @@ func NewProfileWatcherWithAdherence(c client.Client, initialProfile *configv1.TL
 			}
 			return profileState{profile: apiServer.Spec.TLSSecurityProfile, adherence: initialAdherence}, nil
 		},
-		onProfileChange: onProfileChange,
+		onRestart: onRestart,
 	}
 }
 
 func (w *ProfileWatcher) Reconcile(ctx context.Context, _ reconcile.Request) (reconcile.Result, error) {
 	state, err := w.readProfileState(ctx)
 	if err != nil {
+		if apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {
+			watcherLog.Error(err, "permission denied reading TLS profile state; restarting to fail closed")
+			if w.onRestart != nil {
+				w.onRestart()
+			}
+			return reconcile.Result{}, nil
+		}
 		watcherLog.Info("TLS profile state fetch did not succeed, retrying", "retryAfter", profileRetryInterval, "error", err)
 		return reconcile.Result{RequeueAfter: profileRetryInterval}, nil
 	}
-	if !reflect.DeepEqual(w.lastProfile, state.profile) || w.lastAdherence != state.adherence {
+	// Compare effective specs: absent and explicit Intermediate are equivalent.
+	// Invalid profiles must trigger bootstrap validation, not be silently ignored.
+	previous, previousErr := openshifttls.GetTLSProfileSpec(w.lastProfile)
+	current, currentErr := openshifttls.GetTLSProfileSpec(state.profile)
+	profileChanged := previousErr != nil || currentErr != nil ||
+		!reflect.DeepEqual(normalizeTLSProfileSpec(previous), normalizeTLSProfileSpec(current))
+	if profileChanged || w.lastAdherence != state.adherence {
 		watcherLog.Info("TLS security profile or adherence changed, triggering operand refresh", "adherence", state.adherence)
 		w.lastProfile = state.profile
 		w.lastAdherence = state.adherence
-		if w.onProfileChange != nil {
-			w.onProfileChange()
+		if w.onRestart != nil {
+			w.onRestart()
 		}
 	}
 

@@ -29,7 +29,7 @@ COPY hack/get_trustyai_manifests.sh hack/
 RUN bash hack/get_trustyai_manifests.sh
 
 # Runtime image
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:8a842ac769de709143e4edeace516f2008dfdc431b64670ad3353fa323b44736
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:58d09489b1d9123e24d691e47af6c390fe5e08f50c7f4f2967bb64df7ab72aa0
 ARG CI_CONTAINER_VERSION=latest
 
 WORKDIR /

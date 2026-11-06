@@ -14,13 +14,14 @@ data:
     runtime:
       k8s:
         image: $(evalhub-provider-lighteval-image)
+        image_pull_policy: always
         entrypoint:
           - python
           - main.py
         cpu_request: 500m
-        memory_request: 256Gi
+        memory_request: 4Gi
         cpu_limit: 4000m
-        memory_limit: 512Gi
+        memory_limit: 8Gi
       local:
         # used for local mode tests (FVT)
         command: python tests/features/test_data/runtime/main.py

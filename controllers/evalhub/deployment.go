@@ -2,6 +2,7 @@ package evalhub
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 
 	evalhubv1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1"
@@ -76,6 +77,9 @@ func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *e
 
 // buildDeploymentSpec builds the deployment specification for EvalHub
 func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *evalhubv1.EvalHub, providerCMNames []string, collectionCMNames []string, tenantProviderCMNames []string, tenantCollectionCMNames []string) (appsv1.DeploymentSpec, error) {
+	if err := validateManagedTLS(instance); err != nil {
+		return appsv1.DeploymentSpec{}, err
+	}
 	labels := map[string]string{
 		"app":       "eval-hub",
 		"instance":  instance.Name,
@@ -166,7 +170,8 @@ func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *e
 	// API_HOST and PORT are fixed for the loopback HTTP listener; TLS is terminated by kube-rbac-proxy only.
 	// METRICS_PORT and METRICS_HOST are fixed for the dedicated Prometheus metrics server.
 	// EVALHUB_HARDWARE_PROFILES_NAMESPACE is fixed to the applications namespace (r.Namespace).
-	env := mergeEnvVars(defaultEnvVars, instance.Spec.Env, "API_HOST", "PORT", "TLS_CERT_FILE", "TLS_KEY_FILE", "METRICS_PORT", "METRICS_HOST", "EVALHUB_HARDWARE_PROFILES_NAMESPACE")
+	defaultEnvVars = append(defaultEnvVars, managedHTTPEnv("TLS_CERT_FILE", "TLS_KEY_FILE")...)
+	env := mergeEnvVars(defaultEnvVars, instance.Spec.Env, "EVAL_HUB_CONFIG_DIR", "API_HOST", "PORT", "TLS_CERT_FILE", "TLS_KEY_FILE", "METRICS_PORT", "METRICS_HOST", "EVALHUB_HARDWARE_PROFILES_NAMESPACE")
 
 	// Build volume mounts for the evalhub container
 	volumeMounts := []corev1.VolumeMount{
@@ -345,7 +350,7 @@ func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *e
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{
-						Name: instance.Name + "-config",
+						Name: evalHubConfigMapName(instance),
 					},
 				},
 			},
@@ -449,9 +454,14 @@ func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *e
 		})
 	}
 	// Pod template with EvalHub + kube-rbac-proxy and required volumes
+	// Hash auth.yaml so authorization changes trigger a rollout and existing proxy pods use the new policy.
+	authConfigHash := fmt.Sprintf("%x", sha256.Sum256([]byte(generateAuthConfigData())))
 	podTemplate := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: labels,
+			Annotations: map[string]string{
+				evalHubAuthConfigHashAnnotation: authConfigHash,
+			},
 		},
 		Spec: corev1.PodSpec{
 			ServiceAccountName: generateServiceAccountName(instance),
