@@ -57,6 +57,7 @@ allowed_api_resources := {
 	["networking.istio.io", "destinationrules"],
 	["networking.istio.io", "envoyfilters"],
 	["networking.istio.io", "virtualservices"],
+	["networking.k8s.io", "networkpolicies"], # TAS: NetworkPolicy restricting cluster-internal inference traffic (b76b68c7)
 	["route.openshift.io", "routes"],
 
 	# --- monitoring ---
