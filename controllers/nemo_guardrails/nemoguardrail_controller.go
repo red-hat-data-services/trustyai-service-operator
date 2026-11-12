@@ -18,14 +18,17 @@ package nemo_guardrails
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	nemoguardrailsv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/nemo_guardrails/v1alpha1"
 	"github.com/trustyai-explainability/trustyai-service-operator/controllers/constants"
 	templateParser "github.com/trustyai-explainability/trustyai-service-operator/controllers/nemo_guardrails/templates"
 	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
+	pkgtls "github.com/trustyai-explainability/trustyai-service-operator/pkg/tls"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -61,8 +64,10 @@ const (
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments/finalizers,verbs=update
@@ -90,7 +95,29 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// define all the cleanup steps needed before the finalizer can be removed in the CleanupFunc
 	cleanupFunc := func() error {
-		return utils.CleanupClusterRoleBinding(ctx, r.Client, nemoGuardrails)
+		if err := utils.CleanupClusterRoleBinding(ctx, r.Client, nemoGuardrails); err != nil {
+			return err
+		}
+		// status.workloadNamespace stays on the previous namespace until the new Deployment is Ready.
+		// A delete during that move must also remove objects already created in the shared infra namespace.
+		seen := map[string]struct{}{}
+		for _, namespace := range []string{
+			nemoGuardrails.Status.WorkloadNamespace,
+			r.workloadNamespace(nemoGuardrails),
+			nemoGuardrails.Namespace,
+		} {
+			if namespace == "" {
+				continue
+			}
+			if _, ok := seen[namespace]; ok {
+				continue
+			}
+			seen[namespace] = struct{}{}
+			if err := r.deleteOwnedInNamespace(ctx, nemoGuardrails, namespace); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	shouldExit, err := utils.HandleDeletionIfNeeded(ctx, r.Client, nemoGuardrails, finalizerName, cleanupFunc)
 	if err != nil {
@@ -114,7 +141,7 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 		// enforce exposeRoute: false, so an invalid selector cannot leave the server published.
 		if nemoGuardrails.Spec.ExposeRoute != nil && !*nemoGuardrails.Spec.ExposeRoute {
-			if err := utils.DeleteRoute(ctx, r.Client, nemoGuardrails, nemoGuardrails.Name, nemoGuardrails.Namespace); err != nil {
+			if err := r.deleteExposedRoute(ctx, nemoGuardrails, nemoGuardrails.Namespace, previousWorkloadNamespace(nemoGuardrails)); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -144,16 +171,49 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// ====== Resolve the workload namespace ==================================================================================
+	targetNamespace := r.workloadNamespace(nemoGuardrails)
+	if targetNamespace != nemoGuardrails.Namespace {
+		ready, err := r.isWorkloadNamespaceReady(ctx, targetNamespace)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !ready {
+			logger.Info("workload namespace not ready, rejecting",
+				"desired", targetNamespace)
+			_, updateErr := r.updateStatus(ctx, nemoGuardrails, func(saved *nemoguardrailsv1alpha1.NemoGuardrails) {
+				msg := fmt.Sprintf("Workload namespace %s does not exist or is not labeled with %s=true",
+					targetNamespace, WorkloadNamespaceLabel)
+				utils.SetResourceCondition(&saved.Status.Conditions, "Deployment", "WorkloadNamespaceNotReady", msg, corev1.ConditionFalse)
+				utils.SetCompleteCondition(&saved.Status.Conditions, corev1.ConditionFalse, "WorkloadNamespaceNotReady", msg)
+				saved.Status.Phase = utils.PhaseError
+			})
+			if updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			if nemoGuardrails.Spec.ExposeRoute != nil && !*nemoGuardrails.Spec.ExposeRoute {
+				if err := r.deleteExposedRoute(ctx, nemoGuardrails, previousWorkloadNamespace(nemoGuardrails), nemoGuardrails.Namespace); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+	}
+	identity := newWorkloadIdentity(nemoGuardrails, targetNamespace)
+	if err := r.releasePreviousWorkload(ctx, nemoGuardrails, targetNamespace); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// ====== Deploy the CA bundle configmap ============================================================================
-	caBundleConfigMapName := nemoGuardrails.Name + "-ca-bundle"
-	_, _, err = utils.ReconcileConfigMap(ctx, r.Client, nemoGuardrails, caBundleConfigMapName, constants.Version, caBundleTemplate, templateParser.ParseResource)
+	caBundleConfigMapName := identity.Name + "-ca-bundle"
+	_, _, err = utils.ReconcileConfigMapInNamespace(ctx, r.Client, nemoGuardrails, caBundleConfigMapName, targetNamespace, constants.Version, caBundleTemplate, templateParser.ParseResource, identity.Name)
 	if err != nil {
 		utils.LogErrorReconciling(ctx, err, "configmap", caBundleConfigMapName, nemoGuardrails.Namespace)
 		return ctrl.Result{}, err
 	}
 
 	// ====== Load available CA configs and create a unified CA bundle ===================================================
-	caBundleInitContainerConfig, configMapsToMount, caStatus := r.LoadCAConfigs(ctx, logger, *nemoGuardrails)
+	caBundleInitContainerConfig, configMapsToMount, caStatus := r.LoadCAConfigs(ctx, logger, *nemoGuardrails, targetNamespace)
 	nemoGuardrails.Status.CA = caStatus
 	if err := r.updateCAStatusWithRetry(ctx, req.NamespacedName, caStatus); err != nil {
 		utils.LogErrorUpdating(ctx, err, "CA status", nemoGuardrails.Name, nemoGuardrails.Namespace)
@@ -162,30 +222,66 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// ====== Deploy kube-rbac-proxy configmap if needed ================================================================
 	if utils.RequiresAuth(nemoGuardrails) {
-		_, _, err := utils.ReconcileConfigMap(ctx, r.Client, nemoGuardrails, GetRBACConfigName(*nemoGuardrails, false), constants.Version, "kube-rbac-proxy-config.tmpl.yaml", templateParser.ParseResource)
+		_, _, err := utils.ReconcileConfigMapInNamespace(ctx, r.Client, nemoGuardrails, GetRBACConfigName(identity.Name, false), targetNamespace, constants.Version, "kube-rbac-proxy-config.tmpl.yaml", templateParser.ParseResource, identity.Name)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-
-		_, _, err = utils.ReconcileConfigMap(ctx, r.Client, nemoGuardrails, GetRBACConfigName(*nemoGuardrails, true), constants.Version, "kube-rbac-proxy-admin-config.tmpl.yaml", templateParser.ParseResource)
+		_, _, err = utils.ReconcileConfigMapInNamespace(ctx, r.Client, nemoGuardrails, GetRBACConfigName(identity.Name, true), targetNamespace, constants.Version, "kube-rbac-proxy-admin-config.tmpl.yaml", templateParser.ParseResource, identity.Name)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 
 		// create auth serviceaccount
-		if err := utils.ReconcileServiceAccount(ctx, r.Client, nemoGuardrails); err != nil {
+		if err := utils.ReconcileServiceAccountInNamespace(ctx, r.Client, nemoGuardrails, targetNamespace, identity.ServiceAccount); err != nil {
 			return ctrl.Result{}, err
 		}
 
 		// create auth CRB
-		if err := utils.ReconcileAuthDelegatorClusterRoleBinding(ctx, r.Client, nemoGuardrails); err != nil {
+		if err := utils.ReconcileAuthDelegatorClusterRoleBindingInNamespace(ctx, r.Client, nemoGuardrails, targetNamespace, identity.ServiceAccount); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
+	// ====== Reconcile the operand NetworkPolicy =========================================================================
+	// The policy is reconciled before any Deployment creation or update so the
+	// allow rules exist before Pods are created in the workload namespace. CNI
+	// enforcement propagation is asynchronous.
+	if err := r.reconcileNetworkPolicy(ctx, nemoGuardrails, targetNamespace); err != nil {
+		r.reportNetworkPolicyFailure(ctx, nemoGuardrails, err)
+		return ctrl.Result{}, err
+	}
+	r.reportNetworkPolicyReady(ctx, nemoGuardrails)
+
+	// ====== Copy referenced secrets to workload namespace ===============================================================
+	if err := r.ensureReferencedSecretsInNamespace(ctx, nemoGuardrails, targetNamespace); err != nil {
+		utils.LogErrorReconciling(ctx, err, "referenced secrets", nemoGuardrails.Name, targetNamespace)
+		return ctrl.Result{}, err
+	}
+
 	// ====== Create deployment ========================================================================================
+	// Sidecars are rendered only when auth is enabled, so an unusable proxy TLS
+	// profile is not a proxy-free workload's problem. When they are rendered the
+	// Deployment call below fails; report that on the resource instead of leaving
+	// the previous Complete=True condition behind.
+	useAuthProxy := utils.RequiresAuth(nemoGuardrails)
+	if useAuthProxy {
+		if tlsErr := pkgtls.CurrentProxyTLSArgumentsError(); tlsErr != nil {
+			message := fmt.Sprintf("%s: %v", pkgtls.ProxyTLSProfileUnsupportedMessage, tlsErr)
+			if _, updateErr := r.updateStatus(ctx, nemoGuardrails, func(saved *nemoguardrailsv1alpha1.NemoGuardrails) {
+				utils.SetResourceCondition(&saved.Status.Conditions, "Deployment", pkgtls.ReasonProxyTLSProfileUnsupported, message, corev1.ConditionFalse)
+				utils.SetCompleteCondition(&saved.Status.Conditions, corev1.ConditionFalse, pkgtls.ReasonProxyTLSProfileUnsupported, message)
+				saved.Status.Phase = utils.PhaseError
+			}); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			if r.Recorder != nil {
+				r.Recorder.Event(nemoGuardrails, corev1.EventTypeWarning, pkgtls.ReasonProxyTLSProfileUnsupported, message)
+			}
+			return ctrl.Result{}, fmt.Errorf("%s: %w", pkgtls.ProxyTLSProfileUnsupportedMessage, tlsErr)
+		}
+	}
 	existingDeployment := &appsv1.Deployment{}
-	err = r.Get(ctx, types.NamespacedName{Name: nemoGuardrails.Name, Namespace: nemoGuardrails.Namespace}, existingDeployment)
+	err = r.Get(ctx, types.NamespacedName{Name: identity.Name, Namespace: targetNamespace}, existingDeployment)
 	if err != nil && errors.IsNotFound(err) {
 		// Create a new deployment
 		deployment, err := r.createDeployment(ctx, nemoGuardrails, caBundleInitContainerConfig, configMapsToMount)
@@ -221,11 +317,15 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// ====== Reconcile Service ===========================================================================================
 	serviceConfig := utils.ServiceConfig{
-		Name:         nemoGuardrails.Name,
-		Namespace:    nemoGuardrails.Namespace,
-		Owner:        nemoGuardrails,
-		Version:      constants.Version,
-		UseAuthProxy: utils.RequiresAuth(nemoGuardrails),
+		Name:          identity.Name,
+		Namespace:     targetNamespace,
+		Owner:         nemoGuardrails,
+		Version:       constants.Version,
+		UseAuthProxy:  useAuthProxy,
+		WorkloadName:  identity.Name,
+		SelectorName:  identity.Selector,
+		PortName:      identity.PortName,
+		AdminPortName: identity.AdminPortName,
 	}
 	err = utils.EnsureService(ctx, r.Client, nemoGuardrails, serviceConfig, serviceTemplate, templateParser.ParseResource)
 	if err != nil {
@@ -239,9 +339,12 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if utils.RequiresAuth(nemoGuardrails) {
 			termination = utils.Reencrypt
 		}
+		routeName := identity.Name
 		routeConfig := utils.RouteConfig{
-			PortName:    nemoGuardrails.Name,
-			ServiceName: nemoGuardrails.Name,
+			Name:        &routeName,
+			PortName:    identity.PortName,
+			ServiceName: identity.Name,
+			Namespace:   &targetNamespace,
 			Termination: utils.StringPointer(termination),
 		}
 		err = utils.ReconcileRoute(ctx, r.Client, nemoGuardrails, routeConfig, routeTemplate, templateParser.ParseResource)
@@ -250,15 +353,19 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			return ctrl.Result{}, err
 		}
 	} else {
-		err := utils.DeleteRoute(ctx, r.Client, nemoGuardrails, nemoGuardrails.Name, nemoGuardrails.Namespace)
-		if err != nil {
-
+		if err := r.deleteExposedRoute(ctx, nemoGuardrails, targetNamespace, previousWorkloadNamespace(nemoGuardrails)); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
+	if err := r.retireUnscopedNames(ctx, nemoGuardrails, targetNamespace); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.releaseReadyWorkload(ctx, nemoGuardrails, targetNamespace); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// ====== Finalize reconciliation ==================================================================================
-	_, updateErr := r.reconcileStatuses(ctx, nemoGuardrails)
+	_, updateErr := r.reconcileStatuses(ctx, nemoGuardrails, targetNamespace)
 	if updateErr != nil {
 		return ctrl.Result{}, updateErr
 	}
@@ -269,6 +376,12 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 func (r *NemoGuardrailsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&nemoguardrailsv1alpha1.NemoGuardrails{}).
+		// The operand policy lives in the workload namespace, which may differ
+		// from the custom resource namespace, so a controller reference cannot
+		// always be set. An explicit mapping watch on the managed marker and the
+		// owner annotations covers both placements and recreates deleted
+		// policies without competing with another field manager.
+		Watches(&networkingv1.NetworkPolicy{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNemoFromNetworkPolicy), builder.WithPredicates(predicate.NewPredicateFuncs(hasNemoNetworkPolicyIdentity))).
 		// Watch for changes to ConfigMaps referenced by NemoGuardrails CRs.
 		// OnlyMetadata caches only object metadata (~1KB each) instead of full
 		// objects, preventing OOM when many ConfigMaps exist cluster-wide.
