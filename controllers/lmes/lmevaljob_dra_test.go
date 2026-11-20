@@ -71,7 +71,11 @@ func TestCreatePodResourceClaims(t *testing.T) {
 			require.Equal(t, job.Spec.Pod.ResourceClaims, pod.Spec.ResourceClaims)
 			require.Equal(t, *job.Spec.Pod.Container.Resources, pod.Spec.Containers[0].Resources)
 			if consumer != "main" {
-				require.Equal(t, job.Spec.Pod.SideCars[0], pod.Spec.Containers[1])
+				// The sidecar is copied into the Pod with the hardened baseline security
+				// context applied, so compare everything except that field.
+				expectedSidecar := job.Spec.Pod.SideCars[0].DeepCopy()
+				expectedSidecar.SecurityContext = defaultSecurityContext
+				require.Equal(t, *expectedSidecar, pod.Spec.Containers[1])
 			}
 			for _, init := range pod.Spec.InitContainers {
 				require.Empty(t, init.Resources.Claims, "helper init container must not consume devices")

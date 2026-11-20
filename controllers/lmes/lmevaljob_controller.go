@@ -1372,7 +1372,18 @@ func CreatePod(svcOpts *serviceOptions, job *lmesv1alpha1.LMEvalJob, permConfig 
 			},
 		},
 	}
-	containers = append(containers, podSpec.GetSideCards()...)
+	// Sidecars run with the same policy as the main container: protected env
+	// vars are stripped and the security context is merged with the hardened
+	// baseline rather than passed through. podSpec is already a DeepCopy of the
+	// CR, so filtering in place does not mutate the cached object.
+	rawSidecars := podSpec.GetSideCards()
+	filteredSidecars := make([]corev1.Container, len(rawSidecars))
+	copy(filteredSidecars, rawSidecars)
+	for i := range filteredSidecars {
+		filteredSidecars[i].Env = removeProtectedEnvVars(filteredSidecars[i].Env)
+		filteredSidecars[i].SecurityContext = getMainSecurityContext(filteredSidecars[i].SecurityContext)
+	}
+	containers = append(containers, filteredSidecars...)
 
 	// Then compose the Pod CR
 	pod := corev1.Pod{
@@ -1449,20 +1460,47 @@ func getResources(resources *corev1.ResourceRequirements) *corev1.ResourceRequir
 	return resources
 }
 
+// getPodSecurityContext merges the user-supplied pod security context with the
+// hardened baseline instead of letting it replace the baseline wholesale.
 func getPodSecurityContext(securityContext *corev1.PodSecurityContext) *corev1.PodSecurityContext {
-	// user config Overrides default config
 	if securityContext == nil {
 		return defaultPodSecurityContext
 	}
-	return securityContext
+	merged := *securityContext
+	merged.RunAsNonRoot = &runAsNonRootUser
+	merged.SeccompProfile = &corev1.SeccompProfile{
+		Type: corev1.SeccompProfileTypeRuntimeDefault,
+	}
+	return &merged
 }
 
+// getMainSecurityContext merges the user-supplied container security context
+// with the hardened baseline: privilege escalation stays disabled, added
+// capabilities are dropped and DROP ALL is enforced.
 func getMainSecurityContext(securityContext *corev1.SecurityContext) *corev1.SecurityContext {
-	// user config Overrides default config
 	if securityContext == nil {
 		return defaultSecurityContext
 	}
-	return securityContext
+	merged := *securityContext
+	merged.AllowPrivilegeEscalation = &allowPrivilegeEscalation
+	if merged.Capabilities == nil {
+		merged.Capabilities = &corev1.Capabilities{}
+	} else {
+		caps := *merged.Capabilities
+		merged.Capabilities = &caps
+	}
+	merged.Capabilities.Add = nil
+	hasDropAll := false
+	for _, capability := range merged.Capabilities.Drop {
+		if capability == "ALL" {
+			hasDropAll = true
+			break
+		}
+	}
+	if !hasDropAll {
+		merged.Capabilities.Drop = append(merged.Capabilities.Drop, "ALL")
+	}
+	return &merged
 }
 
 // Merge the map based on the filters. If the names in the `src` map contains any prefixes
