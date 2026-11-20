@@ -132,6 +132,15 @@ func ValidateUserInput(job *lmesv1alpha1.LMEvalJob) error {
 		}
 	}
 
+	// Validate user-supplied pod spec fields that are passed through to the Pod
+	if err := ValidatePodVolumes(job.Spec.Pod.GetVolumes()); err != nil {
+		return fmt.Errorf("invalid pod volumes: %w", err)
+	}
+
+	if err := ValidateSidecars(job.Spec.Pod.GetSideCards()); err != nil {
+		return fmt.Errorf("invalid sidecar: %w", err)
+	}
+
 	// Validate custom task git source
 	if job.Spec.TaskList.CustomTasks != nil && len(job.Spec.TaskList.TaskNames) > 0 {
 		gitSource := job.Spec.TaskList.CustomTasks.Source.GitSource
@@ -600,6 +609,40 @@ func ValidateGitCommit(commit string) error {
 		return fmt.Errorf("git commit must be a valid hexadecimal hash (7-40 characters)")
 	}
 
+	return nil
+}
+
+// ValidatePodVolumes rejects user-supplied volume sources that expose the node
+// filesystem to the evaluation Pod. hostPath is the only source that reaches
+// outside the Pod's own namespace-scoped storage, so it is rejected outright.
+func ValidatePodVolumes(volumes []corev1.Volume) error {
+	for i, vol := range volumes {
+		if vol.VolumeSource.HostPath != nil {
+			return fmt.Errorf("volume[%d] %q: hostPath volumes are not permitted", i, vol.Name)
+		}
+	}
+	return nil
+}
+
+// ValidateContainerImage validates a user-supplied container image reference
+func ValidateContainerImage(image string) error {
+	if image == "" {
+		return fmt.Errorf("container image cannot be empty")
+	}
+	if ContainsShellMetacharacters(image) {
+		return fmt.Errorf("container image %q contains invalid characters", image)
+	}
+	return nil
+}
+
+// ValidateSidecars validates the user-supplied sidecar containers that are
+// copied into the evaluation Pod.
+func ValidateSidecars(sidecars []corev1.Container) error {
+	for i, c := range sidecars {
+		if err := ValidateContainerImage(c.Image); err != nil {
+			return fmt.Errorf("sidecar[%d]: %w", i, err)
+		}
+	}
 	return nil
 }
 
