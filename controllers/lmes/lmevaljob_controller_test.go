@@ -349,8 +349,12 @@ func Test_WithCustomPod(t *testing.T) {
 					Command:         generateCmd(svcOpts, job, NewDefaultPermissionConfig()),
 					Args:            generateArgs(svcOpts, job, log),
 					SecurityContext: &corev1.SecurityContext{
-						RunAsUser:  &runAsUser,
-						RunAsGroup: &runAsGroup,
+						RunAsUser:                &runAsUser,
+						RunAsGroup:               &runAsGroup,
+						AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+						Capabilities: &corev1.Capabilities{
+							Drop: []corev1.Capability{"ALL"},
+						},
 					},
 					Ports: []corev1.ContainerPort{
 						{
@@ -420,13 +424,17 @@ func Test_WithCustomPod(t *testing.T) {
 					},
 				},
 				{
-					Name:    "sidecar1",
-					Image:   "busybox",
-					Command: []string{"sh", "-ec", "sleep 3600"},
+					Name:            "sidecar1",
+					Image:           "busybox",
+					Command:         []string{"sh", "-ec", "sleep 3600"},
+					SecurityContext: defaultSecurityContext,
 				},
 			},
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: &runAsNonRootUser,
+				SeccompProfile: &corev1.SeccompProfile{
+					Type: corev1.SeccompProfileTypeRuntimeDefault,
+				},
 			},
 			Volumes: []corev1.Volume{
 				{
@@ -4660,4 +4668,168 @@ func Test_CreatePodWithoutCABundle(t *testing.T) {
 	for _, env := range mainContainer.Env {
 		assert.NotEqual(t, "REQUESTS_CA_BUNDLE", env.Name, "unexpected REQUESTS_CA_BUNDLE env var")
 	}
+}
+
+// Test_SidecarProtectedEnvVarsStripped ensures the protected env var policy is
+// applied to sidecar containers, not only to the main container.
+func Test_SidecarProtectedEnvVarsStripped(t *testing.T) {
+	log := log.FromContext(context.Background())
+	svcOpts := &serviceOptions{
+		PodImage:        "podimage:latest",
+		DriverImage:     "driver:latest",
+		ImagePullPolicy: corev1.PullAlways,
+	}
+	job := &lmesv1alpha1.LMEvalJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "for-testing"},
+		TypeMeta:   metav1.TypeMeta{Kind: lmesv1alpha1.KindName, APIVersion: lmesv1alpha1.Version},
+		Spec: lmesv1alpha1.LMEvalJobSpec{
+			Model:    "hf",
+			TaskList: lmesv1alpha1.TaskList{TaskNames: []string{"task1"}},
+			Pod: &lmesv1alpha1.LMEvalPodSpec{
+				SideCars: []corev1.Container{
+					{
+						Name:  "spy",
+						Image: "busybox",
+						Env: []corev1.EnvVar{
+							{Name: "TRUST_REMOTE_CODE", Value: "1"},
+							{Name: "HF_DATASETS_TRUST_REMOTE_CODE", Value: "1"},
+							{Name: "UNITXT_ALLOW_UNVERIFIED_CODE", Value: "True"},
+							{Name: "SAFE_VAR", Value: "ok"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pod := CreatePod(svcOpts, job, NewDefaultPermissionConfig(), nil, "", log)
+	require.Len(t, pod.Spec.Containers, 2, "should have main + sidecar")
+	sidecar := pod.Spec.Containers[1]
+	envNames := make([]string, 0, len(sidecar.Env))
+	for _, env := range sidecar.Env {
+		envNames = append(envNames, env.Name)
+		assert.NotEqual(t, "TRUST_REMOTE_CODE", env.Name, "protected var must be stripped from sidecar")
+		assert.NotEqual(t, "HF_DATASETS_TRUST_REMOTE_CODE", env.Name, "protected var must be stripped from sidecar")
+		assert.NotEqual(t, "UNITXT_ALLOW_UNVERIFIED_CODE", env.Name, "protected var must be stripped from sidecar")
+	}
+	assert.Contains(t, envNames, "SAFE_VAR", "non-protected var must be preserved")
+	assert.Equal(t, "ok", sidecar.Env[0].Value)
+}
+
+// Test_SidecarSecurityContextHardened ensures user-supplied sidecar security
+// contexts cannot re-enable privilege escalation or add capabilities.
+func Test_SidecarSecurityContextHardened(t *testing.T) {
+	log := log.FromContext(context.Background())
+	svcOpts := &serviceOptions{
+		PodImage:        "podimage:latest",
+		DriverImage:     "driver:latest",
+		ImagePullPolicy: corev1.PullAlways,
+	}
+	privileged := true
+	userCaps := &corev1.Capabilities{Add: []corev1.Capability{"SYS_ADMIN"}}
+	job := &lmesv1alpha1.LMEvalJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "for-testing"},
+		TypeMeta:   metav1.TypeMeta{Kind: lmesv1alpha1.KindName, APIVersion: lmesv1alpha1.Version},
+		Spec: lmesv1alpha1.LMEvalJobSpec{
+			Model:    "hf",
+			TaskList: lmesv1alpha1.TaskList{TaskNames: []string{"task1"}},
+			Pod: &lmesv1alpha1.LMEvalPodSpec{
+				SideCars: []corev1.Container{
+					{
+						Name:  "spy",
+						Image: "busybox",
+						SecurityContext: &corev1.SecurityContext{
+							AllowPrivilegeEscalation: &privileged,
+							Capabilities:             userCaps,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pod := CreatePod(svcOpts, job, NewDefaultPermissionConfig(), nil, "", log)
+	require.Len(t, pod.Spec.Containers, 2, "should have main + sidecar")
+	sidecarCtx := pod.Spec.Containers[1].SecurityContext
+	require.NotNil(t, sidecarCtx)
+	assert.False(t, *sidecarCtx.AllowPrivilegeEscalation, "sidecar privilege escalation must stay disabled")
+	require.NotNil(t, sidecarCtx.Capabilities)
+	assert.Empty(t, sidecarCtx.Capabilities.Add, "sidecar added capabilities must be stripped")
+	assert.Contains(t, sidecarCtx.Capabilities.Drop, corev1.Capability("ALL"), "sidecar must drop ALL")
+
+	// The CR must not be mutated by the filtering.
+	assert.Equal(t, []corev1.Capability{"SYS_ADMIN"}, job.Spec.Pod.SideCars[0].SecurityContext.Capabilities.Add)
+	assert.True(t, *job.Spec.Pod.SideCars[0].SecurityContext.AllowPrivilegeEscalation)
+}
+
+func Test_SecurityContextMerge(t *testing.T) {
+	runAsUser := int64(1000)
+
+	t.Run("main ctx nil returns default", func(t *testing.T) {
+		merged := getMainSecurityContext(nil)
+		assert.Equal(t, defaultSecurityContext, merged)
+	})
+
+	t.Run("main ctx without capabilities gets DROP ALL added", func(t *testing.T) {
+		userCtx := &corev1.SecurityContext{RunAsUser: &runAsUser}
+		merged := getMainSecurityContext(userCtx)
+		assert.Equal(t, &runAsUser, merged.RunAsUser, "user field preserved")
+		assert.False(t, *merged.AllowPrivilegeEscalation, "AllowPrivilegeEscalation always false")
+		require.NotNil(t, merged.Capabilities)
+		assert.Contains(t, merged.Capabilities.Drop, corev1.Capability("ALL"), "DROP ALL always present")
+	})
+
+	t.Run("main ctx added capabilities are stripped", func(t *testing.T) {
+		userCtx := &corev1.SecurityContext{
+			Capabilities: &corev1.Capabilities{Add: []corev1.Capability{"NET_ADMIN"}},
+		}
+		merged := getMainSecurityContext(userCtx)
+		assert.Empty(t, merged.Capabilities.Add, "added capabilities are stripped")
+		assert.Contains(t, merged.Capabilities.Drop, corev1.Capability("ALL"), "DROP ALL always present")
+	})
+
+	t.Run("main ctx with capabilities but no DROP ALL gets it appended", func(t *testing.T) {
+		userCtx := &corev1.SecurityContext{
+			RunAsUser: &runAsUser,
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"NET_RAW"},
+			},
+		}
+		merged := getMainSecurityContext(userCtx)
+		assert.Contains(t, merged.Capabilities.Drop, corev1.Capability("ALL"), "DROP ALL appended")
+		assert.Contains(t, merged.Capabilities.Drop, corev1.Capability("NET_RAW"), "existing drop preserved")
+		assert.NotContains(t, userCtx.Capabilities.Drop, corev1.Capability("ALL"), "original not mutated")
+	})
+
+	t.Run("main ctx with DROP ALL already present does not duplicate", func(t *testing.T) {
+		userCtx := &corev1.SecurityContext{
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+		}
+		merged := getMainSecurityContext(userCtx)
+		count := 0
+		for _, capability := range merged.Capabilities.Drop {
+			if capability == "ALL" {
+				count++
+			}
+		}
+		assert.Equal(t, 1, count, "ALL must appear exactly once")
+	})
+
+	t.Run("pod ctx nil returns default", func(t *testing.T) {
+		merged := getPodSecurityContext(nil)
+		assert.Equal(t, defaultPodSecurityContext, merged)
+	})
+
+	t.Run("pod ctx merges user fields and enforces baseline", func(t *testing.T) {
+		fsGroup := int64(2000)
+		userPodCtx := &corev1.PodSecurityContext{FSGroup: &fsGroup}
+		merged := getPodSecurityContext(userPodCtx)
+		assert.Equal(t, &fsGroup, merged.FSGroup, "user field preserved")
+		assert.True(t, *merged.RunAsNonRoot, "RunAsNonRoot always true")
+		require.NotNil(t, merged.SeccompProfile)
+		assert.Equal(t, corev1.SeccompProfileTypeRuntimeDefault, merged.SeccompProfile.Type, "SeccompProfile always RuntimeDefault")
+		assert.Nil(t, userPodCtx.SeccompProfile, "original not mutated")
+	})
 }

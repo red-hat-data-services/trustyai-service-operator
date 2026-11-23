@@ -1796,3 +1796,144 @@ func Test_ValidateUserInputWithOCI(t *testing.T) {
 		assert.Contains(t, err.Error(), "invalid OCI authentication")
 	})
 }
+
+func Test_ValidatePodVolumes(t *testing.T) {
+	hostPathType := corev1.HostPathDirectory
+	tests := []struct {
+		name    string
+		volumes []corev1.Volume
+		wantErr bool
+	}{
+		{name: "no volumes", volumes: nil, wantErr: false},
+		{
+			name: "PVC volume allowed",
+			volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "mypvc"},
+				},
+			}},
+			wantErr: false,
+		},
+		{
+			name: "emptyDir volume allowed",
+			volumes: []corev1.Volume{{
+				Name:         "scratch",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}},
+			wantErr: false,
+		},
+		{
+			name: "hostPath volume rejected",
+			volumes: []corev1.Volume{{
+				Name: "host",
+				VolumeSource: corev1.VolumeSource{
+					HostPath: &corev1.HostPathVolumeSource{Path: "/etc", Type: &hostPathType},
+				},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "hostPath rejected among allowed volumes",
+			volumes: []corev1.Volume{
+				{
+					Name:         "scratch",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				},
+				{
+					Name: "host",
+					VolumeSource: corev1.VolumeSource{
+						HostPath: &corev1.HostPathVolumeSource{Path: "/var/run"},
+					},
+				},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidatePodVolumes(tt.volumes)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), "hostPath volumes are not permitted")
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func Test_ValidateSidecars(t *testing.T) {
+	tests := []struct {
+		name     string
+		sidecars []corev1.Container
+		wantErr  bool
+	}{
+		{name: "no sidecars", sidecars: nil, wantErr: false},
+		{name: "valid image", sidecars: []corev1.Container{{Name: "s", Image: "busybox:latest"}}, wantErr: false},
+		{name: "valid image with digest", sidecars: []corev1.Container{{Name: "s", Image: "registry.example.com/sidecar@sha256:abc"}}, wantErr: false},
+		{name: "empty image", sidecars: []corev1.Container{{Name: "s", Image: ""}}, wantErr: true},
+		{name: "shell metachar in image", sidecars: []corev1.Container{{Name: "s", Image: "img;rm -rf /"}}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSidecars(tt.sidecars)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// Test_ValidateUserInputRejectsUnsafePodSpec covers the wiring of the pod spec
+// checks into ValidateUserInput, which is what the reconciler calls.
+func Test_ValidateUserInputRejectsUnsafePodSpec(t *testing.T) {
+	hostPathType := corev1.HostPathDirectory
+	newJob := func(pod *lmesv1alpha1.LMEvalPodSpec) *lmesv1alpha1.LMEvalJob {
+		return &lmesv1alpha1.LMEvalJob{
+			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "for-testing"},
+			TypeMeta:   metav1.TypeMeta{Kind: lmesv1alpha1.KindName, APIVersion: lmesv1alpha1.Version},
+			Spec: lmesv1alpha1.LMEvalJobSpec{
+				Model:    "hf",
+				TaskList: lmesv1alpha1.TaskList{TaskNames: []string{"task1"}},
+				Pod:      pod,
+			},
+		}
+	}
+
+	t.Run("safe pod spec accepted", func(t *testing.T) {
+		job := newJob(&lmesv1alpha1.LMEvalPodSpec{
+			Volumes: []corev1.Volume{{
+				Name:         "scratch",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}},
+			SideCars: []corev1.Container{{Name: "s", Image: "busybox:latest"}},
+		})
+		assert.NoError(t, ValidateUserInput(job))
+	})
+
+	t.Run("hostPath volume rejected", func(t *testing.T) {
+		job := newJob(&lmesv1alpha1.LMEvalPodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "host",
+				VolumeSource: corev1.VolumeSource{
+					HostPath: &corev1.HostPathVolumeSource{Path: "/etc", Type: &hostPathType},
+				},
+			}},
+		})
+		err := ValidateUserInput(job)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid pod volumes")
+	})
+
+	t.Run("sidecar with empty image rejected", func(t *testing.T) {
+		job := newJob(&lmesv1alpha1.LMEvalPodSpec{
+			SideCars: []corev1.Container{{Name: "s", Image: ""}},
+		})
+		err := ValidateUserInput(job)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid sidecar")
+	})
+}
