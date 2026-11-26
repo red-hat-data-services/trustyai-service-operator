@@ -1,10 +1,20 @@
-packages: []
-reinstallPackages:
-  - shadow-utils
+# RPM dependencies for trustyai-operator-module/Dockerfile.konflux (runtime stage).
+# Regenerate with:
+#   rpm-lockfile-prototype --outfile trustyai-operator-module/.konflux/rpms.lock.yaml \
+#       trustyai-operator-module/.konflux/rpms.in.yaml
 contentOrigin:
-  repofiles: ["redhat.repo"]
+  repos:
+    - repoid: ubi-10-for-$basearch-baseos-rpms
+      baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi10/10/$basearch/baseos/os/
+    - repoid: ubi-10-for-$basearch-appstream-rpms
+      baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi10/10/$basearch/appstream/os/
+packages:
+  - shadow-utils
 arches:
   - aarch64
   - x86_64
   - ppc64le
   - s390x
+context:
+  containerfile:
+    file: ../Dockerfile.konflux
