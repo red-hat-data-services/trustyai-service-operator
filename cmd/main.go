@@ -23,8 +23,6 @@ import (
 	"os"
 	"time"
 
-	kservev1alpha1 "github.com/kserve/kserve/pkg/apis/serving/v1alpha1"
-	kservev1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
@@ -80,8 +78,6 @@ func init() {
 	utilruntime.Must(evalhubv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(evalhubv1.AddToScheme(scheme))
 	utilruntime.Must(monitoringv1.AddToScheme(scheme))
-	utilruntime.Must(kservev1alpha1.AddToScheme(scheme))
-	utilruntime.Must(kservev1beta1.AddToScheme(scheme))
 	utilruntime.Must(configv1.Install(scheme))
 	utilruntime.Must(routev1.AddToScheme(scheme))
 	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
@@ -142,7 +138,13 @@ func run() int {
 		setupLog.Error(err, "unable to resolve TLS configuration")
 		return 1
 	}
-	pkgtls.SetProxyTLSArguments(tlsResult.ProxyArgs)
+	pkgtls.SetProxyTLSArguments(tlsResult.ProxyArgs, tlsResult.ProxyArgsErr)
+	if tlsResult.ProxyArgsErr != nil {
+		// Workload concern: the operator keeps running and the reconcilers
+		// fail the affected resources with a condition until the cluster TLS
+		// profile is fixed.
+		setupLog.Error(tlsResult.ProxyArgsErr, "cluster TLS profile cannot be served by the kube-rbac-proxy sidecars; reconciliation of managed workloads will fail until the profile is fixed")
+	}
 
 	metricsOpts := server.Options{
 		BindAddress:   metricsAddr,
@@ -176,6 +178,7 @@ func run() int {
 					&corev1.Secret{},
 					&corev1.Pod{},
 					&corev1.Service{},
+					&corev1.Namespace{},
 				},
 			},
 		},

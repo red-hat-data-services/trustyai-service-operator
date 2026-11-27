@@ -33,6 +33,7 @@ func ControllerSetUp(mgr manager.Manager, ns, operatorConfigMapName string, reco
 	SetManagedEvalHubLister(mgr.GetClient())
 	return (&EvalHubReconciler{
 		Client:                mgr.GetClient(),
+		APIReader:             mgr.GetAPIReader(),
 		Scheme:                mgr.GetScheme(),
 		restMapper:            mgr.GetRESTMapper(),
 		Namespace:             ns,
@@ -44,6 +45,10 @@ func ControllerSetUp(mgr manager.Manager, ns, operatorConfigMapName string, reco
 // EvalHubReconciler reconciles an EvalHub object
 type EvalHubReconciler struct {
 	client.Client
+	// APIReader reads past the manager cache. Pod identity repair needs it
+	// because the shared Pod informer is metadata-only, so a cached typed read
+	// cannot resolve a Pod's labels.
+	APIReader             client.Reader
 	Scheme                *runtime.Scheme
 	restMapper            meta.RESTMapper
 	Namespace             string
@@ -58,7 +63,7 @@ type EvalHubReconciler struct {
 //+kubebuilder:rbac:groups=trustyai.opendatahub.io,resources=status-events,verbs=create
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=list;watch;get;create;update;patch;delete
 //+kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update
+//+kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;delete
 //+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;delete
@@ -236,8 +241,17 @@ func (r *EvalHubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		return RequeueWithError(err)
 	}
 
+	var evalHubConfigData map[string]string
 	err = tracing.WithPhase(ctx, spanReconcileConfigMap, func(ctx context.Context) error {
-		if err := r.reconcileConfigMap(ctx, instance); err != nil {
+		var generateErr error
+		evalHubConfigData, generateErr = r.generateConfigData(ctx, instance)
+		if generateErr != nil {
+			log.Error(generateErr, "Failed to generate ConfigMap data")
+			instance.SetStatus("Ready", "Error", fmt.Sprintf("Failed to generate ConfigMap data: %v", generateErr), corev1.ConditionFalse)
+			r.Status().Update(ctx, instance)
+			return generateErr
+		}
+		if err := r.reconcileConfigMapWithData(ctx, instance, evalHubConfigData); err != nil {
 			log.Error(err, "Failed to reconcile ConfigMap")
 			instance.SetStatus("Ready", "Error", fmt.Sprintf("Failed to reconcile ConfigMap: %v", err), corev1.ConditionFalse)
 			r.Status().Update(ctx, instance)
@@ -307,7 +321,7 @@ func (r *EvalHubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			}
 			return err
 		}
-		if err := r.reconcileDeployment(ctx, instance, providerCMNames, collectionCMNames, tenantProviderCMNames, tenantCollectionCMNames); err != nil {
+		if err := r.reconcileDeploymentWithConfigData(ctx, instance, providerCMNames, collectionCMNames, tenantProviderCMNames, tenantCollectionCMNames, evalHubConfigData); err != nil {
 			log.Error(err, "Failed to reconcile Deployment")
 			instance.SetStatus("Ready", "Error", fmt.Sprintf("Failed to reconcile Deployment: %v", err), corev1.ConditionFalse)
 			r.Status().Update(ctx, instance)
@@ -397,6 +411,16 @@ func (r *EvalHubReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&corev1.Service{}, builder.OnlyMetadata).
 		Owns(&corev1.ConfigMap{}, builder.OnlyMetadata).
+		// A running Pod that loses its NetworkPolicy identity labels leaves the
+		// selector and keeps serving outside the policy, so label changes are
+		// reconciled rather than left to the next unrelated event. The mapper
+		// proves Pod -> ReplicaSet -> Deployment -> EvalHub before enqueueing.
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapEvalHubPodToRequest), builder.OnlyMetadata, builder.WithPredicates(predicate.Funcs{
+			CreateFunc:  func(e event.CreateEvent) bool { return hasEvalHubPodIdentityHint(e.Object) },
+			DeleteFunc:  func(e event.DeleteEvent) bool { return hasEvalHubPodIdentityHint(e.Object) },
+			UpdateFunc:  func(e event.UpdateEvent) bool { return evalHubPodLabelsChanged(e.ObjectOld, e.ObjectNew) },
+			GenericFunc: func(e event.GenericEvent) bool { return hasEvalHubPodIdentityHint(e.Object) },
+		})).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.mapNamespaceToEvalHubs), builder.OnlyMetadata, builder.WithPredicates(tenantLabelPredicate())).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.mapTenantConfigMapToEvalHub), builder.WithPredicates(tenantConfigMapPredicate()))
 

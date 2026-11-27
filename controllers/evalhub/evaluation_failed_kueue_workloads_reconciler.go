@@ -312,9 +312,9 @@ func (r *EvalHubEvaluationFailedKueueWorkloadsReconciler) Reconcile(ctx context.
 	}
 
 	providerID := job.Labels[evalHubProviderIDLabel]
-	benchmarkID := job.Labels[evalHubBenchmarkIDLabel]
+	benchmarkID := strings.TrimSpace(job.Annotations[evalHubBenchmarkIDAnnotation])
 	if providerID == "" || benchmarkID == "" {
-		log.V(1).Info("skip EvalHub POST: missing provider_id or benchmark_id label on Job",
+		log.V(1).Info("skip EvalHub POST: missing provider_id label or benchmark_id metadata on Job",
 			append(evaluationFailedKueueWorkloadsLogFields(), "action", "skip_missing_label",
 				"workload", wl.Name, "job", job.Name, "namespace", job.Namespace)...)
 		return ctrl.Result{}, nil
@@ -338,7 +338,10 @@ func (r *EvalHubEvaluationFailedKueueWorkloadsReconciler) Reconcile(ctx context.
 
 	failureMsg, failureCode := classifyKueueAdmissionFailure(&job, cond)
 
-	if err := postEvalHubBenchmarkFailed(ctx, r.RESTConfig, baseURL, job.Namespace, jobID, providerID, benchmarkID, benchmarkIndex, failureMsg, failureCode); err != nil {
+	if err := postEvalHubBenchmarkFailed(ctx, r.RESTConfig, baseURL, job.Namespace, jobID, providerID, benchmarkID, benchmarkIndex, failureMsg, failureCode); err != nil && !errors.Is(err, errEvalHubReportAlreadyTerminal) {
+		if errors.Is(err, errEvalHubReportSuperseded) {
+			return ctrl.Result{}, nil
+		}
 		log.Error(err, "failed to post EvalHub benchmark failure event for Kueue workload",
 			append(evaluationFailedKueueWorkloadsLogFields(), "action", "post_events_failed",
 				"workload", wl.Name, "workloadNamespace", wl.Namespace, "queue", wl.Spec.QueueName,
